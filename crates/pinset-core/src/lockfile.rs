@@ -7,18 +7,20 @@ use std::{
 
 use atomic_write_file::AtomicWriteFile;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     ArtifactIntegrity, DOTNET_TARGETS, DotnetArchiveFormat, DotnetVersion, Error, FLUTTER_TARGETS,
     FlutterArchiveFormat, GO_TARGETS, GoArchiveFormat, JAVA_TARGETS, JavaArchiveFormat,
     JavaVersion, NodeArchiveFormat, PYTHON_TARGETS, PYTHON_VARIANT, RUST_COMPONENTS, RUST_PROFILE,
-    RUST_TARGETS, Result, RustArchiveFormat, SourceConfig, parse_python_distribution,
-    plan_dotnet_artifact, plan_flutter_artifact, plan_go_artifact, plan_java_artifact,
-    plan_node_artifact, plan_python_artifact, plan_rust_artifact,
+    RUST_TARGETS, Result, RustArchiveFormat, SourceConfig, is_exact_python_version,
+    parse_python_distribution, plan_dotnet_artifact, plan_flutter_artifact, plan_go_artifact,
+    plan_java_artifact_with_package, plan_node_artifact, plan_python_artifact, plan_rust_artifact,
+    plan_rust_nightly_artifact,
 };
 
 pub const LOCKFILE_FILENAME: &str = "pinset.lock";
-pub const LOCKFILE_SCHEMA: u32 = 3;
+pub const LOCKFILE_SCHEMA: u32 = 5;
 pub const MVP_NODE_TARGETS: [&str; 5] = [
     "windows-x86_64",
     "macos-aarch64",
@@ -51,6 +53,8 @@ pub struct LockedTool {
     pub released_at: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub metadata: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: BTreeMap<String, String>,
     #[serde(rename = "artifact")]
     pub artifacts: Vec<LockedArtifact>,
 }
@@ -85,6 +89,8 @@ pub struct LockedArtifactOverlay {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LockedArtifactFormat {
+    #[serde(rename = "binary")]
+    Binary,
     #[serde(rename = "zip")]
     Zip,
     #[serde(rename = "tar.xz")]
@@ -96,6 +102,7 @@ pub enum LockedArtifactFormat {
 impl LockedArtifactFormat {
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Binary => "binary",
             Self::Zip => "zip",
             Self::TarXz => "tar.xz",
             Self::TarGz => "tar.gz",
@@ -131,6 +138,7 @@ impl Lockfile {
                     ),
                     ("manifest_source".to_owned(), manifest_source),
                 ]),
+                options: BTreeMap::new(),
                 artifacts,
             }],
         }
@@ -158,6 +166,40 @@ impl Lockfile {
 }
 
 impl LockedTool {
+    /// Stable on-disk identity. Legacy locks keep the historical version-only layout.
+    pub fn installation_version(&self) -> String {
+        let mut identity_options = self.options.clone();
+        if self.provider == "declarative-github-release" {
+            for key in ["provider-id", "provider-revision", "registry-fingerprint"] {
+                if let Some(value) = self.metadata.get(key) {
+                    identity_options.insert(format!("provider.{key}"), value.clone());
+                }
+            }
+        }
+        if self
+            .metadata
+            .get("channel")
+            .is_some_and(|channel| channel == "nightly")
+            && let Some(date) = self.metadata.get("manifest_date")
+        {
+            identity_options
+                .entry("nightly-date".to_owned())
+                .or_insert_with(|| date.clone());
+        }
+        if identity_options.is_empty() {
+            return self.version.clone();
+        }
+        let mut canonical = String::new();
+        for (key, value) in &identity_options {
+            canonical.push_str(key);
+            canonical.push('=');
+            canonical.push_str(value);
+            canonical.push('\n');
+        }
+        let digest = hex::encode(Sha256::digest(canonical.as_bytes()));
+        format!("{}--{}", self.version, &digest[..12])
+    }
+
     pub fn artifact(&self, target: &str) -> Option<&LockedArtifact> {
         self.artifacts
             .iter()
@@ -190,6 +232,50 @@ pub fn lockfile_path(project_config_path: &Path) -> PathBuf {
 }
 
 pub fn load_lockfile(path: &Path) -> Result<Lockfile> {
+    let lockfile = parse_lockfile(path)?;
+    validate_lockfile(&lockfile)?;
+    Ok(lockfile)
+}
+
+/// Loads a lockfile for a state-changing command that can refresh the historical
+/// pre-1.0 target matrices before saving it again.
+///
+/// The relaxed result must never be used for installation or command resolution.
+/// Every artifact that is present is still validated strictly; the only tolerated
+/// gaps are the exact provider matrices shipped before Linux ARM64 support was
+/// added in Pinset 1.0.
+pub fn load_lockfile_for_provider_refresh(path: &Path) -> Result<(Lockfile, Vec<String>)> {
+    let lockfile = parse_lockfile(path)?;
+    match validate_lockfile(&lockfile) {
+        Ok(()) => Ok((lockfile, Vec::new())),
+        Err(strict_error) => {
+            validate_lockfile_with_target_policy(
+                &lockfile,
+                TargetMatrixPolicy::AllowPreV1LinuxArm64Matrices,
+            )?;
+            let mut refresh_tools = lockfile
+                .tools
+                .iter()
+                .filter(|tool| has_pre_v1_target_matrix(tool))
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>();
+            refresh_tools.sort();
+            if refresh_tools.is_empty() {
+                return Err(strict_error);
+            }
+            Ok((lockfile, refresh_tools))
+        }
+    }
+}
+
+/// Backwards-compatible target-refresh loader retained for callers that only
+/// need to know whether any historical provider matrix requires repair.
+pub fn load_lockfile_for_target_refresh(path: &Path) -> Result<(Lockfile, bool)> {
+    let (lockfile, refresh_tools) = load_lockfile_for_provider_refresh(path)?;
+    Ok((lockfile, !refresh_tools.is_empty()))
+}
+
+fn parse_lockfile(path: &Path) -> Result<Lockfile> {
     let content = fs::read_to_string(path).map_err(|source| Error::ReadLockfile {
         path: path.to_path_buf(),
         source,
@@ -198,7 +284,6 @@ pub fn load_lockfile(path: &Path) -> Result<Lockfile> {
         path: path.to_path_buf(),
         source,
     })?;
-    validate_lockfile(&lockfile)?;
     Ok(lockfile)
 }
 
@@ -297,8 +382,43 @@ pub fn validate_lock_matches_tools(
     Ok(())
 }
 
+pub fn validate_lock_matches_tool_options(
+    lockfile: &Lockfile,
+    configured: &BTreeMap<String, crate::ToolOptions>,
+    selection_path: &Path,
+) -> Result<()> {
+    for locked in &lockfile.tools {
+        let expected = configured
+            .get(&locked.name)
+            .map(crate::ToolOptions::lock_options)
+            .unwrap_or_default();
+        if locked.options != expected {
+            return Err(Error::LockfileMismatch {
+                selection_path: selection_path.to_path_buf(),
+                tool: locked.name.clone(),
+                configured: format!("{} with structured options", locked.requested),
+                locked: format!("{} with different structured options", locked.version),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetMatrixPolicy {
+    Current,
+    AllowPreV1LinuxArm64Matrices,
+}
+
 fn validate_lockfile(lockfile: &Lockfile) -> Result<()> {
-    if !matches!(lockfile.schema, 1 | 2 | LOCKFILE_SCHEMA) {
+    validate_lockfile_with_target_policy(lockfile, TargetMatrixPolicy::Current)
+}
+
+fn validate_lockfile_with_target_policy(
+    lockfile: &Lockfile,
+    target_policy: TargetMatrixPolicy,
+) -> Result<()> {
+    if !matches!(lockfile.schema, 1 | 2 | 3 | 4 | LOCKFILE_SCHEMA) {
         return Err(Error::UnsupportedLockfileSchema {
             actual: lockfile.schema,
         });
@@ -308,6 +428,14 @@ fn validate_lockfile(lockfile: &Lockfile) -> Result<()> {
             reason: "generated_by cannot be empty".to_owned(),
         });
     }
+    if lockfile.schema < 4 && lockfile.tools.iter().any(|tool| !tool.options.is_empty()) {
+        return Err(Error::InvalidLockfile {
+            reason: format!(
+                "lockfile schema {} cannot contain structured tool options",
+                lockfile.schema
+            ),
+        });
+    }
     let mut tool_names = HashSet::with_capacity(lockfile.tools.len());
     for tool in &lockfile.tools {
         if !tool_names.insert(&tool.name) {
@@ -315,8 +443,30 @@ fn validate_lockfile(lockfile: &Lockfile) -> Result<()> {
                 reason: format!("duplicate tool {}", tool.name),
             });
         }
-        validate_locked_tool(tool)?;
-        if lockfile.schema < LOCKFILE_SCHEMA && tool.requested != tool.version {
+        validate_locked_tool_with_target_policy(tool, target_policy)?;
+        // Schema 3 introduced independent requested selectors (for example,
+        // `bun = "latest"`) while keeping the resolved version exact in the lock.
+        // Only schema 1/2 require the two values to be identical.
+        if lockfile.schema < LOCKFILE_SCHEMA
+            && !has_complete_target_matrix(tool)
+            && !(target_policy == TargetMatrixPolicy::AllowPreV1LinuxArm64Matrices
+                && has_pre_v1_target_matrix(tool))
+        {
+            return Err(Error::InvalidLockfile {
+                reason: if has_pre_v1_target_matrix(tool) {
+                    format!(
+                        "schema {} {} lock is missing the historical linux-aarch64 target; refresh the provider lock",
+                        lockfile.schema, tool.name
+                    )
+                } else {
+                    format!(
+                        "schema {} requires the historical complete target matrix for {}; refresh the provider lock",
+                        lockfile.schema, tool.name
+                    )
+                },
+            });
+        }
+        if lockfile.schema < 3 && tool.requested != tool.version {
             return Err(Error::InvalidLockfile {
                 reason: format!(
                     "schema {} requires {} requested and resolved versions to match",
@@ -333,7 +483,17 @@ fn validate_lockfile(lockfile: &Lockfile) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_locked_tool(tool: &LockedTool) -> Result<()> {
+    validate_locked_tool_with_target_policy(tool, TargetMatrixPolicy::Current)
+}
+
+fn validate_locked_tool_with_target_policy(
+    tool: &LockedTool,
+    target_policy: TargetMatrixPolicy,
+) -> Result<()> {
+    let pre_v1_target_matrix = target_policy == TargetMatrixPolicy::AllowPreV1LinuxArm64Matrices
+        && has_pre_v1_target_matrix(tool);
     if tool
         .released_at
         .as_deref()
@@ -343,18 +503,24 @@ fn validate_locked_tool(tool: &LockedTool) -> Result<()> {
             reason: format!("{} has an invalid released-at timestamp", tool.name),
         });
     }
-    let provider_supported = matches!(
-        (tool.name.as_str(), tool.provider.as_str()),
-        ("node", "nodejs-official")
-            | ("pnpm", "pnpm-npm")
-            | ("bun", "bun-npm")
-            | ("go", "go-official")
-            | ("flutter", "flutter-official")
-            | ("java", "adoptium-temurin")
-            | ("rust", "rust-official")
-            | ("dotnet", "microsoft-dotnet-sdk")
-            | ("python", "python-build-standalone")
-    );
+    let declarative_provider = tool.provider == "declarative-github-release"
+        && crate::runtime_provider(&tool.name).is_some_and(|provider| {
+            provider.capabilities.metadata == crate::RuntimeMetadataKind::Declarative
+        });
+    let provider_supported = declarative_provider
+        || matches!(
+            (tool.name.as_str(), tool.provider.as_str()),
+            ("node", "nodejs-official")
+                | ("pnpm", "pnpm-npm")
+                | ("bun", "bun-npm")
+                | ("go", "go-official")
+                | ("flutter", "flutter-official")
+                | ("java", "adoptium-temurin")
+                | ("rust", "rust-official")
+                | ("dotnet", "microsoft-dotnet-sdk")
+                | ("python", "python.org-cpython")
+                | ("python", "python-build-standalone")
+        );
     if !provider_supported {
         return Err(Error::InvalidLockfile {
             reason: format!(
@@ -374,6 +540,7 @@ fn validate_locked_tool(tool: &LockedTool) -> Result<()> {
         && tool.name != "python"
         && tool.name != "rust"
         && tool.name != "dotnet"
+        && !declarative_provider
         && !tool.metadata.is_empty()
     {
         return Err(Error::InvalidLockfile {
@@ -388,122 +555,40 @@ fn validate_locked_tool(tool: &LockedTool) -> Result<()> {
             });
         }
         match tool.name.as_str() {
-            "node" => validate_locked_node_artifact(&tool.version, artifact)?,
+            "node" => validate_locked_node_artifact(&tool.version, artifact, pre_v1_target_matrix)?,
             "go" => validate_locked_go_artifact(&tool.version, artifact)?,
             "flutter" => validate_locked_flutter_artifact(&tool.version, artifact)?,
             "java" => validate_locked_java_artifact(tool, artifact)?,
             "rust" => validate_locked_rust_artifact(tool, artifact)?,
             "dotnet" => validate_locked_dotnet_artifact(tool, artifact)?,
-            "python" => validate_locked_python_artifact(&tool.version, artifact)?,
+            "python" => validate_locked_python_artifact(tool, artifact)?,
             "pnpm" | "bun" => validate_locked_npm_artifact(tool, artifact)?,
+            _ if declarative_provider => validate_locked_declarative_artifact(tool, artifact)?,
             _ => unreachable!("provider pair checked above"),
         }
     }
     if tool.name == "node" {
-        validate_node_metadata(tool)?;
-        for target in MVP_NODE_TARGETS {
-            if !targets.contains(target) {
+        if pre_v1_target_matrix {
+            if !tool.metadata.is_empty() {
                 return Err(Error::InvalidLockfile {
-                    reason: format!("missing Node MVP artifact for {target}"),
+                    reason: "pre-1.0 Node lock cannot contain provider metadata".to_owned(),
                 });
             }
-        }
-    } else if tool.name == "go" {
-        for target in GO_TARGETS {
-            if !targets.contains(target) {
-                return Err(Error::InvalidLockfile {
-                    reason: format!("missing Go artifact for {target}"),
-                });
-            }
-        }
-        if targets.len() != GO_TARGETS.len() {
-            return Err(Error::InvalidLockfile {
-                reason: "Go lock contains an unsupported artifact target".to_owned(),
-            });
+        } else {
+            validate_node_metadata(tool)?;
         }
     } else if tool.name == "flutter" {
         validate_flutter_metadata(tool)?;
-        for target in FLUTTER_TARGETS {
-            if !targets.contains(target) {
-                return Err(Error::InvalidLockfile {
-                    reason: format!("missing Flutter artifact for {target}"),
-                });
-            }
-        }
-        if targets.len() != FLUTTER_TARGETS.len() {
-            return Err(Error::InvalidLockfile {
-                reason: "Flutter lock contains an unsupported artifact target".to_owned(),
-            });
-        }
     } else if tool.name == "python" {
         validate_python_metadata(tool)?;
-        for target in PYTHON_TARGETS {
-            if !targets.contains(target) {
-                return Err(Error::InvalidLockfile {
-                    reason: format!("missing Python artifact for {target}"),
-                });
-            }
-        }
-        if targets.len() != PYTHON_TARGETS.len() {
-            return Err(Error::InvalidLockfile {
-                reason: "Python lock contains an unsupported artifact target".to_owned(),
-            });
-        }
     } else if tool.name == "java" {
         validate_java_metadata(tool)?;
-        for target in JAVA_TARGETS {
-            if !targets.contains(target) {
-                return Err(Error::InvalidLockfile {
-                    reason: format!("missing Java artifact for {target}"),
-                });
-            }
-        }
-        if targets.len() != JAVA_TARGETS.len() {
-            return Err(Error::InvalidLockfile {
-                reason: "Java lock contains an unsupported artifact target".to_owned(),
-            });
-        }
     } else if tool.name == "rust" {
         validate_rust_metadata(tool)?;
-        for target in RUST_TARGETS {
-            if !targets.contains(target) {
-                return Err(Error::InvalidLockfile {
-                    reason: format!("missing Rust artifact for {target}"),
-                });
-            }
-        }
-        if targets.len() != RUST_TARGETS.len() {
-            return Err(Error::InvalidLockfile {
-                reason: "Rust lock contains an unsupported artifact target".to_owned(),
-            });
-        }
     } else if tool.name == "dotnet" {
         validate_dotnet_metadata(tool)?;
-        for target in DOTNET_TARGETS {
-            if !targets.contains(target) {
-                return Err(Error::InvalidLockfile {
-                    reason: format!("missing .NET SDK artifact for {target}"),
-                });
-            }
-        }
-        if targets.len() != DOTNET_TARGETS.len() {
-            return Err(Error::InvalidLockfile {
-                reason: ".NET SDK lock contains an unsupported artifact target".to_owned(),
-            });
-        }
-    } else {
-        for (target, _) in npm_tool_targets(&tool.name) {
-            if !targets.contains(target) {
-                return Err(Error::InvalidLockfile {
-                    reason: format!("missing {} artifact for {target}", tool.name),
-                });
-            }
-        }
-        if targets.len() != npm_tool_targets(&tool.name).len() {
-            return Err(Error::InvalidLockfile {
-                reason: format!("{} lock contains an unsupported artifact target", tool.name),
-            });
-        }
+    } else if declarative_provider {
+        validate_declarative_metadata(tool)?;
     }
     if tool.artifacts.is_empty() {
         return Err(Error::InvalidLockfile {
@@ -511,6 +596,65 @@ fn validate_locked_tool(tool: &LockedTool) -> Result<()> {
         });
     }
     Ok(())
+}
+
+const PRE_V1_NODE_TARGETS: &[&str] = &[
+    "windows-x86_64",
+    "macos-aarch64",
+    "macos-x86_64",
+    "linux-x86_64",
+];
+const PRE_V1_PNPM_TARGETS: &[&str] = &["windows-x86_64", "linux-x86_64", "macos-aarch64"];
+const PRE_V1_BUN_TARGETS: &[&str] = &[
+    "windows-x86_64-avx2",
+    "windows-x86_64-baseline",
+    "linux-x86_64-avx2",
+    "linux-x86_64-baseline",
+    "macos-aarch64",
+];
+const PRE_V1_STANDARD_TARGETS: &[&str] = &[
+    "windows-x86_64",
+    "macos-aarch64",
+    "macos-x86_64",
+    "linux-x86_64",
+];
+
+fn has_pre_v1_target_matrix(tool: &LockedTool) -> bool {
+    let expected = match tool.name.as_str() {
+        "node" => PRE_V1_NODE_TARGETS,
+        "pnpm" => PRE_V1_PNPM_TARGETS,
+        "bun" => PRE_V1_BUN_TARGETS,
+        "go" | "python" | "java" | "rust" | "dotnet" => PRE_V1_STANDARD_TARGETS,
+        _ => return false,
+    };
+    tool.artifacts.len() == expected.len()
+        && tool
+            .artifacts
+            .iter()
+            .all(|artifact| expected.contains(&artifact.target.as_str()))
+}
+
+fn has_complete_target_matrix(tool: &LockedTool) -> bool {
+    let expected = match tool.name.as_str() {
+        "node" => MVP_NODE_TARGETS.as_slice(),
+        "go" => GO_TARGETS.as_slice(),
+        "flutter" => FLUTTER_TARGETS.as_slice(),
+        "python" => PYTHON_TARGETS.as_slice(),
+        "java" => JAVA_TARGETS.as_slice(),
+        "rust" => RUST_TARGETS.as_slice(),
+        "dotnet" => DOTNET_TARGETS.as_slice(),
+        "pnpm" | "bun" => {
+            return tool.artifacts.len() == npm_tool_targets(&tool.name).len()
+                && npm_tool_targets(&tool.name)
+                    .iter()
+                    .all(|(target, _)| tool.artifact(target).is_some());
+        }
+        _ => return true,
+    };
+    tool.artifacts.len() == expected.len()
+        && expected
+            .iter()
+            .all(|target| tool.artifact(target).is_some())
 }
 
 fn validate_node_metadata(tool: &LockedTool) -> Result<()> {
@@ -564,6 +708,32 @@ fn validate_flutter_metadata(tool: &LockedTool) -> Result<()> {
 }
 
 fn validate_python_metadata(tool: &LockedTool) -> Result<()> {
+    if tool.provider == "python.org-cpython" {
+        let expected = BTreeMap::from([
+            ("distribution".to_owned(), "python.org/cpython".to_owned()),
+            (
+                "install_kind".to_owned(),
+                tool.metadata
+                    .get("install_kind")
+                    .filter(|value| {
+                        matches!(
+                            value.as_str(),
+                            "full-zip" | "embeddable-zip" | "msi" | "msi-bundle"
+                        )
+                    })
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            ("python_version".to_owned(), tool.version.clone()),
+        ]);
+        if !is_exact_python_version(&tool.version) || tool.metadata != expected {
+            return Err(Error::InvalidLockfile {
+                reason: "official Python lock metadata must identify the exact CPython version and python.org install kind"
+                    .to_owned(),
+            });
+        }
+        return Ok(());
+    }
     let (python_version, build_id) = parse_python_distribution(&tool.version)?;
     let expected = BTreeMap::from([
         ("build_id".to_owned(), build_id.to_owned()),
@@ -599,10 +769,35 @@ fn validate_java_metadata(tool: &LockedTool) -> Result<()> {
         .ok_or_else(|| Error::InvalidLockfile {
             reason: "Java lock metadata has no OpenJDK version".to_owned(),
         })?;
+    let image_type = tool
+        .metadata
+        .get("image_type")
+        .filter(|value| matches!(value.as_str(), "jdk" | "jre"))
+        .ok_or_else(|| Error::InvalidLockfile {
+            reason: "Java lock metadata must identify a jdk or jre package".to_owned(),
+        })?;
+    if tool.options.is_empty() {
+        if image_type != "jdk" {
+            return Err(Error::InvalidLockfile {
+                reason: "legacy Java locks without options may only identify a JDK".to_owned(),
+            });
+        }
+    } else {
+        let expected_options = BTreeMap::from([
+            ("distribution".to_owned(), "temurin".to_owned()),
+            ("package".to_owned(), image_type.clone()),
+        ]);
+        if tool.options != expected_options {
+            return Err(Error::InvalidLockfile {
+                reason: "Java lock options must identify the Temurin distribution and jdk or jre package"
+                    .to_owned(),
+            });
+        }
+    }
     let mut expected = BTreeMap::from([
         ("distribution".to_owned(), "eclipse-temurin".to_owned()),
         ("vendor".to_owned(), "eclipse".to_owned()),
-        ("image_type".to_owned(), "jdk".to_owned()),
+        ("image_type".to_owned(), image_type.clone()),
         ("jvm_impl".to_owned(), "hotspot".to_owned()),
         ("heap_size".to_owned(), "normal".to_owned()),
         ("release_type".to_owned(), "ga".to_owned()),
@@ -618,7 +813,7 @@ fn validate_java_metadata(tool: &LockedTool) -> Result<()> {
     }
     if tool.metadata != expected {
         return Err(Error::InvalidLockfile {
-            reason: "Java lock metadata must identify one Eclipse Temurin GA JDK/HotSpot release and each archive signature"
+            reason: "Java lock metadata must identify one Eclipse Temurin GA JDK/JRE HotSpot release and each archive signature"
                 .to_owned(),
         });
     }
@@ -626,6 +821,7 @@ fn validate_java_metadata(tool: &LockedTool) -> Result<()> {
 }
 
 fn validate_rust_metadata(tool: &LockedTool) -> Result<()> {
+    use crate::rust_provider::rust_component_name;
     let date = tool
         .metadata
         .get("manifest_date")
@@ -640,23 +836,100 @@ fn validate_rust_metadata(tool: &LockedTool) -> Result<()> {
         .ok_or_else(|| Error::InvalidLockfile {
             reason: "Rust lock metadata has no valid manifest SHA-256".to_owned(),
         })?;
-    let expected = BTreeMap::from([
-        ("channel".to_owned(), "stable".to_owned()),
-        ("components".to_owned(), RUST_COMPONENTS.to_owned()),
-        ("manifest_date".to_owned(), date.clone()),
-        (
-            "manifest_sha256".to_owned(),
-            manifest_sha256.to_ascii_lowercase(),
-        ),
-        ("profile".to_owned(), RUST_PROFILE.to_owned()),
-    ]);
-    if tool.metadata != expected {
+    let channel = tool
+        .metadata
+        .get("channel")
+        .filter(|value| matches!(value.as_str(), "stable" | "nightly"))
+        .ok_or_else(|| Error::InvalidLockfile {
+            reason: "Rust lock metadata has no supported channel".to_owned(),
+        })?;
+    let profile = tool
+        .metadata
+        .get("profile")
+        .filter(|value| matches!(value.as_str(), "minimal" | "default" | "complete"))
+        .ok_or_else(|| Error::InvalidLockfile {
+            reason: "Rust lock metadata has no supported profile".to_owned(),
+        })?;
+    let components = tool
+        .metadata
+        .get("components")
+        .filter(|value| {
+            let values = value
+                .split(',')
+                .map(rust_component_name)
+                .collect::<Vec<_>>();
+            !values.is_empty()
+                && values.iter().all(|component| !component.is_empty())
+                && values.iter().collect::<HashSet<_>>().len() == values.len()
+        })
+        .ok_or_else(|| Error::InvalidLockfile {
+            reason: "Rust lock metadata has no valid component set".to_owned(),
+        })?;
+    let expected_keys = [
+        "channel",
+        "components",
+        "manifest_date",
+        "manifest_sha256",
+        "profile",
+    ];
+    if tool.metadata.len() != expected_keys.len()
+        || expected_keys
+            .iter()
+            .any(|key| !tool.metadata.contains_key(*key))
+        || manifest_sha256 != &manifest_sha256.to_ascii_lowercase()
+    {
         return Err(Error::InvalidLockfile {
-            reason: "Rust lock metadata must identify one stable default-profile v2 manifest"
+            reason: "Rust lock metadata must identify one v2 channel manifest".to_owned(),
+        });
+    }
+    for key in tool.options.keys() {
+        if !matches!(key.as_str(), "profile" | "components" | "targets" | "date") {
+            return Err(Error::InvalidLockfile {
+                reason: format!("Rust lock contains unsupported option {key}"),
+            });
+        }
+    }
+    if tool
+        .options
+        .get("profile")
+        .is_some_and(|value| value != profile)
+        || tool.options.get("components").is_some_and(|value| {
+            let resolved = components
+                .split(',')
+                .map(rust_component_name)
+                .collect::<HashSet<_>>();
+            value
+                .split(',')
+                .map(rust_component_name)
+                .any(|component| !resolved.contains(component))
+        })
+        || tool.options.get("date").is_some_and(|value| value != date)
+        || (channel == "nightly"
+            && tool.requested != format!("nightly-{date}")
+            && !(tool.requested == "nightly"
+                && tool.options.get("date").is_some_and(|value| value == date)))
+        || (channel == "stable" && tool.requested.starts_with("nightly"))
+        || (tool.options.is_empty()
+            && (profile != RUST_PROFILE || !valid_rust_default_components(components)))
+    {
+        return Err(Error::InvalidLockfile {
+            reason: "Rust lock metadata does not match its selector and structured options"
                 .to_owned(),
         });
     }
     Ok(())
+}
+
+fn valid_rust_default_components(components: &str) -> bool {
+    // Official profiles use package aliases and include the Windows-only
+    // rust-mingw component even in a manifest consumed on Linux or macOS.
+    let actual = components
+        .split(',')
+        .map(crate::rust_provider::rust_component_name)
+        .filter(|component| *component != "rust-mingw")
+        .collect::<HashSet<_>>();
+    actual == RUST_COMPONENTS.split(',').collect()
+        || actual == "rustc,cargo,rust-std,rust-docs".split(',').collect()
 }
 
 fn validate_dotnet_metadata(tool: &LockedTool) -> Result<()> {
@@ -685,9 +958,9 @@ fn validate_dotnet_metadata(tool: &LockedTool) -> Result<()> {
     let support_phase = tool
         .metadata
         .get("support_phase")
-        .filter(|value| matches!(value.as_str(), "active" | "maintenance"))
+        .filter(|value| matches!(value.as_str(), "active" | "maintenance" | "eol"))
         .ok_or_else(|| Error::InvalidLockfile {
-            reason: ".NET SDK lock metadata is not in a supported phase".to_owned(),
+            reason: ".NET SDK lock metadata has an unknown support phase".to_owned(),
         })?;
     let expected = BTreeMap::from([
         ("channel".to_owned(), version.channel()),
@@ -698,11 +971,100 @@ fn validate_dotnet_metadata(tool: &LockedTool) -> Result<()> {
     ]);
     if tool.metadata != expected {
         return Err(Error::InvalidLockfile {
-            reason: ".NET SDK lock metadata must identify one supported Microsoft GA SDK release"
-                .to_owned(),
+            reason: ".NET SDK lock metadata must identify one Microsoft GA SDK release".to_owned(),
         });
     }
     Ok(())
+}
+
+fn validate_declarative_metadata(tool: &LockedTool) -> Result<()> {
+    let expected = [
+        "provider-id",
+        "provider-revision",
+        "registry-fingerprint",
+        "repository",
+        "tag",
+    ];
+    let provider_id = tool.metadata.get("provider-id");
+    let revision = tool
+        .metadata
+        .get("provider-revision")
+        .and_then(|value| value.parse::<u32>().ok());
+    let fingerprint = tool.metadata.get("registry-fingerprint");
+    let repository = tool.metadata.get("repository");
+    let tag = tool.metadata.get("tag");
+    if !is_exact_numeric_triplet(&tool.version)
+        || !tool.options.is_empty()
+        || tool.released_at.is_none()
+        || tool.metadata.len() != expected.len()
+        || expected.iter().any(|key| !tool.metadata.contains_key(*key))
+        || provider_id.is_none_or(|value| !valid_scoped_name(value))
+        || revision.is_none_or(|value| value == 0)
+        || fingerprint.is_none_or(|value| {
+            value.len() != 40
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'A'..=b'F'))
+        })
+        || repository.is_none_or(|value| !valid_scoped_name(value))
+        || tag.is_none_or(|value| !valid_lock_component(value))
+    {
+        return Err(Error::InvalidLockfile {
+            reason: format!(
+                "{} declarative lock metadata must identify one Provider revision, signer, repository and release tag",
+                tool.name
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_locked_declarative_artifact(
+    tool: &LockedTool,
+    artifact: &LockedArtifact,
+) -> Result<()> {
+    let repository = &tool.metadata["repository"];
+    let tag = &tool.metadata["tag"];
+    let expected_url = format!(
+        "https://github.com/{repository}/releases/download/{tag}/{}",
+        artifact.artifact_path
+    );
+    let integrity = artifact.artifact_integrity()?;
+    if artifact.format != LockedArtifactFormat::Binary
+        || !artifact.archive_root.is_empty()
+        || artifact.verification != "https-checksum"
+        || !artifact.overlays.is_empty()
+        || !valid_lock_component(&artifact.artifact_path)
+        || artifact.canonical_url != expected_url
+        || integrity.algorithm() != crate::IntegrityAlgorithm::Sha256
+        || integrity.cache_key() != artifact.sha256
+    {
+        return Err(Error::InvalidLockfile {
+            reason: format!(
+                "{} declarative artifact {} does not match its verified binary identity",
+                tool.name, artifact.target
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn valid_scoped_name(value: &str) -> bool {
+    let mut parts = value.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(owner), Some(name), None)
+            if valid_lock_component(owner) && valid_lock_component(name)
+    )
+}
+
+fn valid_lock_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.starts_with('.')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn valid_release_date(value: &str) -> bool {
@@ -809,7 +1171,11 @@ fn validate_locked_go_artifact(version: &str, artifact: &LockedArtifact) -> Resu
     Ok(())
 }
 
-fn validate_locked_node_artifact(version: &str, artifact: &LockedArtifact) -> Result<()> {
+fn validate_locked_node_artifact(
+    version: &str,
+    artifact: &LockedArtifact,
+    allow_pre_v1_verification: bool,
+) -> Result<()> {
     let plan = plan_node_artifact(&SourceConfig::default(), version, &artifact.target)?;
     let expected_format = match plan.format {
         NodeArchiveFormat::Zip => LockedArtifactFormat::Zip,
@@ -832,11 +1198,16 @@ fn validate_locked_node_artifact(version: &str, artifact: &LockedArtifact) -> Re
             reason: format!("invalid SHA-256 for {}", artifact.target),
         });
     }
-    if artifact.verification != "nodejs-openpgp-sha256"
-        && !artifact
+    let current_verification = artifact.verification == "nodejs-openpgp-sha256"
+        || artifact
             .verification
-            .starts_with("nodejs-openpgp-sha256-source:")
-    {
+            .starts_with("nodejs-openpgp-sha256-source:");
+    let pre_v1_verification = allow_pre_v1_verification
+        && (artifact.verification == "nodejs-shasums-https"
+            || artifact
+                .verification
+                .starts_with("nodejs-shasums-https-source:"));
+    if !current_verification && !pre_v1_verification {
         return Err(Error::InvalidLockfile {
             reason: format!(
                 "unsupported Node verification for {}; regenerate this pre-1.0 lock with `pinset use node@<selector>`",
@@ -852,31 +1223,111 @@ fn validate_locked_node_artifact(version: &str, artifact: &LockedArtifact) -> Re
     Ok(())
 }
 
-fn validate_locked_python_artifact(version: &str, artifact: &LockedArtifact) -> Result<()> {
-    let plan = plan_python_artifact(&SourceConfig::default(), version, &artifact.target)?;
-    if artifact.canonical_url != plan.canonical_url
-        || artifact.artifact_path != plan.artifact_path
-        || artifact.archive_root != plan.archive_root
-        || artifact.format != LockedArtifactFormat::TarGz
-    {
-        return Err(Error::InvalidLockfile {
-            reason: format!(
-                "artifact identity for {} does not match the built-in Python provider",
-                artifact.target
-            ),
-        });
+fn validate_locked_python_artifact(tool: &LockedTool, artifact: &LockedArtifact) -> Result<()> {
+    if tool.provider == "python.org-cpython" {
+        let expected_url =
+            SourceConfig::default().official_artifact_url("python", &artifact.artifact_path)?;
+        let expected_format = match tool.metadata.get("install_kind").map(String::as_str) {
+            Some("full-zip" | "embeddable-zip") => LockedArtifactFormat::Zip,
+            Some("msi" | "msi-bundle") => LockedArtifactFormat::Binary,
+            _ => {
+                return Err(Error::InvalidLockfile {
+                    reason: "official Python lock has an unsupported install kind".to_owned(),
+                });
+            }
+        };
+        if !PYTHON_TARGETS.contains(&artifact.target.as_str())
+            || artifact.canonical_url != expected_url
+            || !artifact
+                .artifact_path
+                .starts_with(&format!("{}/", tool.version))
+            || !artifact.archive_root.is_empty()
+            || artifact.format != expected_format
+        {
+            return Err(Error::InvalidLockfile {
+                reason: format!(
+                    "artifact identity for {} does not match the official python.org provider",
+                    artifact.target
+                ),
+            });
+        }
+        if !matches!(
+            artifact.verification.as_str(),
+            "python-org-api-sha256" | "python-org-https-sha256"
+        ) {
+            return Err(Error::InvalidLockfile {
+                reason: format!(
+                    "unsupported official Python verification for {}",
+                    artifact.target
+                ),
+            });
+        }
+    } else {
+        let plan = plan_python_artifact(&SourceConfig::default(), &tool.version, &artifact.target)?;
+        let expected_path = format!(
+            "/astral-sh/python-build-standalone/releases/download/{}",
+            plan.artifact_path
+        );
+        let url =
+            url::Url::parse(&artifact.canonical_url).map_err(|source| Error::InvalidLockfile {
+                reason: format!("invalid Python standalone artifact URL: {source}"),
+            })?;
+        if artifact.artifact_path != plan.artifact_path
+            || artifact.archive_root != plan.archive_root
+            || artifact.format != LockedArtifactFormat::TarGz
+            || url.scheme() != "https"
+            || url.host_str() != Some("github.com")
+            || (url.path() != expected_path && url.path() != expected_path.replace('+', "%2B"))
+            || artifact.verification != "python-build-standalone-versions-sha256"
+        {
+            return Err(Error::InvalidLockfile {
+                reason: format!(
+                    "artifact identity for {} does not match the Python standalone fallback provider",
+                    artifact.target
+                ),
+            });
+        }
     }
     if artifact.artifact_integrity()?.algorithm() != crate::IntegrityAlgorithm::Sha256 {
         return Err(Error::InvalidLockfile {
             reason: format!("invalid Python SHA-256 for {}", artifact.target),
         });
     }
-    if artifact.verification != "python-build-standalone-versions-sha256" {
-        return Err(Error::InvalidLockfile {
-            reason: format!("unsupported Python verification for {}", artifact.target),
-        });
-    }
-    if !artifact.overlays.is_empty() {
+    let msi_bundle = tool.provider == "python.org-cpython"
+        && tool.metadata.get("install_kind").map(String::as_str) == Some("msi-bundle");
+    if msi_bundle {
+        let expected = ["core.msi", "exe.msi"];
+        if !artifact.artifact_path.ends_with("/amd64/lib.msi")
+            || artifact.overlays.len() != expected.len()
+        {
+            return Err(Error::InvalidLockfile {
+                reason: format!(
+                    "official Python MSI bundle is incomplete for {}",
+                    artifact.target
+                ),
+            });
+        }
+        for (overlay, filename) in artifact.overlays.iter().zip(expected) {
+            let expected_url =
+                SourceConfig::default().official_artifact_url("python", &overlay.artifact_path)?;
+            if overlay.canonical_url != expected_url
+                || !overlay
+                    .artifact_path
+                    .ends_with(&format!("/amd64/{filename}"))
+                || overlay.format != LockedArtifactFormat::Binary
+                || !overlay.archive_root.is_empty()
+                || overlay.verification != "python-org-https-sha256"
+                || overlay.artifact_integrity()?.algorithm() != crate::IntegrityAlgorithm::Sha256
+            {
+                return Err(Error::InvalidLockfile {
+                    reason: format!(
+                        "invalid official Python MSI bundle component {filename} for {}",
+                        artifact.target
+                    ),
+                });
+            }
+        }
+    } else if !artifact.overlays.is_empty() {
         return Err(Error::InvalidLockfile {
             reason: format!(
                 "Python artifact {} cannot contain overlays",
@@ -902,10 +1353,17 @@ fn validate_locked_java_artifact(tool: &LockedTool, artifact: &LockedArtifact) -
         .ok_or_else(|| Error::InvalidLockfile {
             reason: format!("Java artifact {} has no package name", artifact.target),
         })?;
-    let plan = plan_java_artifact(
+    let image_type = tool
+        .metadata
+        .get("image_type")
+        .ok_or_else(|| Error::InvalidLockfile {
+            reason: "Java lock metadata has no image_type".to_owned(),
+        })?;
+    let plan = plan_java_artifact_with_package(
         &tool.version,
         release_name,
         &artifact.target,
+        image_type,
         package_name,
         &artifact.canonical_url,
     )?;
@@ -950,12 +1408,25 @@ fn validate_locked_rust_artifact(tool: &LockedTool, artifact: &LockedArtifact) -
             .ok_or_else(|| Error::InvalidLockfile {
                 reason: "Rust lock metadata has no manifest_date".to_owned(),
             })?;
-    let plan = plan_rust_artifact(
-        &tool.version,
-        manifest_date,
-        &artifact.target,
-        &artifact.canonical_url,
-    )?;
+    let nightly = tool
+        .metadata
+        .get("channel")
+        .is_some_and(|channel| channel == "nightly");
+    let plan = if nightly {
+        plan_rust_nightly_artifact(
+            &tool.version,
+            manifest_date,
+            &artifact.target,
+            &artifact.canonical_url,
+        )?
+    } else {
+        plan_rust_artifact(
+            &tool.version,
+            manifest_date,
+            &artifact.target,
+            &artifact.canonical_url,
+        )?
+    };
     let expected_format = match plan.format {
         RustArchiveFormat::TarXz => LockedArtifactFormat::TarXz,
     };
@@ -981,10 +1452,44 @@ fn validate_locked_rust_artifact(tool: &LockedTool, artifact: &LockedArtifact) -
             reason: format!("unsupported Rust verification for {}", artifact.target),
         });
     }
-    if !artifact.overlays.is_empty() {
+    let channel = if nightly { "nightly" } else { &tool.version };
+    let expected_targets = tool
+        .options
+        .get("targets")
+        .map(|targets| {
+            targets
+                .split(',')
+                .filter(|target| !target.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if artifact.overlays.len() != expected_targets.len() {
         return Err(Error::InvalidLockfile {
-            reason: format!("Rust artifact {} cannot contain overlays", artifact.target),
+            reason: format!(
+                "Rust artifact {} has {} target overlays, expected {}",
+                artifact.target,
+                artifact.overlays.len(),
+                expected_targets.len()
+            ),
         });
+    }
+    for (overlay, target) in artifact.overlays.iter().zip(expected_targets) {
+        let archive_name = format!("rust-std-{channel}-{target}.tar.xz");
+        let expected_url =
+            format!("https://static.rust-lang.org/dist/{manifest_date}/{archive_name}");
+        if overlay.canonical_url != expected_url
+            || overlay.artifact_path != format!("dist/{manifest_date}/{archive_name}")
+            || overlay.archive_root != format!("rust-std-{channel}-{target}")
+            || overlay.format != LockedArtifactFormat::TarXz
+            || overlay.verification != "rust-v2-manifest-sha256"
+            || overlay.artifact_integrity()?.algorithm() != crate::IntegrityAlgorithm::Sha256
+        {
+            return Err(Error::InvalidLockfile {
+                reason: format!(
+                    "Rust target overlay {target} does not match the built-in Rust provider"
+                ),
+            });
+        }
     }
     Ok(())
 }
@@ -1040,13 +1545,18 @@ fn validate_locked_npm_artifact(tool: &LockedTool, artifact: &LockedArtifact) ->
         .ok_or_else(|| Error::InvalidLockfile {
             reason: format!("unsupported {} target {}", tool.name, artifact.target),
         })?;
-    let package_base = package.rsplit('/').next().expect("npm package is nonempty");
-    let artifact_path = format!("{package}/-/{package_base}-{}.tgz", tool.version);
-    let canonical_url = format!("https://registry.npmjs.org/{artifact_path}");
-    if artifact.archive_root != "package"
-        || artifact.canonical_url != canonical_url
-        || artifact.artifact_path != artifact_path
-    {
+    let packages = if tool.name == "pnpm" {
+        pnpm_target_packages(&artifact.target, package)
+    } else {
+        vec![package]
+    };
+    let valid_identity = packages.into_iter().any(|package| {
+        let package_base = package.rsplit('/').next().expect("npm package is nonempty");
+        let artifact_path = format!("{package}/-/{package_base}-{}.tgz", tool.version);
+        let canonical_url = format!("https://registry.npmjs.org/{artifact_path}");
+        artifact.canonical_url == canonical_url && artifact.artifact_path == artifact_path
+    });
+    if artifact.archive_root != "package" || !valid_identity {
         return Err(Error::InvalidLockfile {
             reason: format!("invalid npm artifact identity for {}", artifact.target),
         });
@@ -1095,12 +1605,22 @@ fn pnpm_uses_wrapper_overlay(version: &str) -> Result<bool> {
         .split_once('.')
         .and_then(|(major, _)| major.parse::<u64>().ok())
     {
-        Some(10) => Ok(false),
-        Some(11) => Ok(true),
-        _ => Err(Error::InvalidLockfile {
-            reason: format!("unsupported pnpm version {version}"),
+        Some(major) => Ok(major >= 11),
+        None => Err(Error::InvalidLockfile {
+            reason: format!("invalid pnpm version {version}"),
         }),
     }
+}
+
+fn pnpm_target_packages<'a>(target: &str, legacy: &'a str) -> Vec<&'a str> {
+    let modern = match target {
+        "windows-x86_64" => Some("@pnpm/exe.win32-x64"),
+        "linux-x86_64" => Some("@pnpm/exe.linux-x64"),
+        "linux-aarch64" => Some("@pnpm/exe.linux-arm64"),
+        "macos-aarch64" => Some("@pnpm/exe.darwin-arm64"),
+        _ => None,
+    };
+    std::iter::once(legacy).chain(modern).collect()
 }
 
 fn validate_pnpm_overlay(version: &str, overlay: &LockedArtifactOverlay) -> Result<()> {
@@ -1203,33 +1723,162 @@ mod tests {
     }
 
     #[test]
+    fn target_refresh_loader_accepts_only_known_pre_v1_provider_matrices() {
+        let root = tempdir().expect("temp directory");
+        let path = root.path().join(LOCKFILE_FILENAME);
+        let legacy = Lockfile {
+            schema: 2,
+            generated_by: "pinset 0.9.0".to_owned(),
+            tools: vec![
+                locked_npm_tool("bun", "1.3.14", false),
+                locked_npm_tool("pnpm", "11.21.0", false),
+            ],
+        };
+        fs::write(&path, toml::to_string_pretty(&legacy).expect("legacy TOML"))
+            .expect("legacy lockfile");
+
+        let strict = load_lockfile(&path).expect_err("strict loader rejects the old matrix");
+        assert!(strict.to_string().contains("linux-aarch64"));
+        let (loaded, refresh_tools) =
+            load_lockfile_for_provider_refresh(&path).expect("refresh loader accepts old matrix");
+        assert_eq!(refresh_tools, ["bun", "pnpm"]);
+        assert_eq!(loaded.tools, legacy.tools);
+
+        let (_, requires_refresh) = load_lockfile_for_target_refresh(&path)
+            .expect("compatibility loader accepts old matrix");
+        assert!(requires_refresh);
+
+        let mut corrupted = legacy;
+        corrupted.tools[0].artifacts[0].canonical_url =
+            "https://example.invalid/bun.tgz".to_owned();
+        fs::write(
+            &path,
+            toml::to_string_pretty(&corrupted).expect("corrupt TOML"),
+        )
+        .expect("corrupt lockfile");
+        let error = load_lockfile_for_provider_refresh(&path)
+            .expect_err("refresh loader still validates every present artifact");
+        assert!(error.to_string().contains("invalid npm artifact identity"));
+    }
+
+    #[test]
+    fn target_refresh_loader_detects_every_provider_expanded_in_v1() {
+        let root = tempdir().expect("temp directory");
+        let path = root.path().join(LOCKFILE_FILENAME);
+
+        for name in [
+            "node", "pnpm", "bun", "go", "python", "java", "rust", "dotnet",
+        ] {
+            let mut tool = locked_current_provider_tool(name);
+            tool.artifacts
+                .retain(|artifact| artifact.target != "linux-aarch64");
+            if name == "node" {
+                tool.metadata.clear();
+                for artifact in &mut tool.artifacts {
+                    artifact.verification = "nodejs-shasums-https".to_owned();
+                }
+            } else if name == "java" {
+                tool.metadata.remove("signature_link.linux-aarch64");
+            }
+            let legacy = Lockfile {
+                schema: 2,
+                generated_by: "pinset 0.9.0".to_owned(),
+                tools: vec![tool],
+            };
+            fs::write(&path, toml::to_string_pretty(&legacy).expect("legacy TOML"))
+                .expect("legacy lockfile");
+
+            load_lockfile(&path).expect_err("strict loader rejects the old matrix");
+            let (loaded, refresh_tools) = load_lockfile_for_provider_refresh(&path)
+                .unwrap_or_else(|error| panic!("refresh loader rejected {name}: {error}"));
+            assert_eq!(refresh_tools, [name]);
+            assert_eq!(loaded.tools, legacy.tools);
+        }
+    }
+
+    #[test]
+    fn schema_three_provider_refresh_accepts_selectors_for_every_legacy_matrix() {
+        let root = tempdir().expect("temp directory");
+        let path = root.path().join(LOCKFILE_FILENAME);
+
+        for (name, requested) in [
+            ("node", "24"),
+            ("pnpm", "11"),
+            ("bun", "latest"),
+            ("go", "1.25"),
+            ("python", "3.14"),
+            ("java", "21"),
+            ("rust", "stable"),
+            ("dotnet", "10.0"),
+        ] {
+            let mut tool = locked_current_provider_tool(name);
+            tool.requested = requested.to_owned();
+            tool.artifacts
+                .retain(|artifact| artifact.target != "linux-aarch64");
+            if name == "node" {
+                tool.metadata.clear();
+                for artifact in &mut tool.artifacts {
+                    artifact.verification = "nodejs-shasums-https".to_owned();
+                }
+            } else if name == "java" {
+                tool.metadata.remove("signature_link.linux-aarch64");
+            }
+            let legacy = Lockfile {
+                schema: 3,
+                generated_by: "pinset 2.1.6".to_owned(),
+                tools: vec![tool],
+            };
+            fs::write(&path, toml::to_string_pretty(&legacy).expect("legacy TOML"))
+                .expect("legacy lockfile");
+
+            load_lockfile(&path).expect_err("strict loader rejects the old matrix");
+            let (loaded, refresh_tools) = load_lockfile_for_provider_refresh(&path)
+                .unwrap_or_else(|error| panic!("refresh loader rejected {name}: {error}"));
+            assert_eq!(refresh_tools, [name]);
+            assert_eq!(loaded.tools[0].requested, requested);
+        }
+    }
+
+    #[test]
     fn schema_three_separates_requested_selector_from_resolved_version() {
-        let artifacts = MVP_NODE_TARGETS
-            .into_iter()
-            .map(locked_artifact)
-            .collect::<Vec<_>>();
-        let mut lockfile = Lockfile::new_node(
-            "pinset 1.5.0".to_owned(),
-            "24.0.0".to_owned(),
-            "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356".to_owned(),
-            "official".to_owned(),
-            artifacts,
-        );
-        lockfile.tools[0].requested = "24".to_owned();
+        for (name, requested) in [
+            ("node", "24"),
+            ("pnpm", "11"),
+            ("bun", "latest"),
+            ("go", "1.25"),
+            ("flutter", "stable"),
+            ("python", "3.14"),
+            ("java", "21"),
+            ("rust", "stable"),
+            ("dotnet", "10.0"),
+        ] {
+            let mut tool = locked_current_provider_tool(name);
+            tool.requested = requested.to_owned();
+            let resolved = tool.version.clone();
+            let mut lockfile = Lockfile {
+                schema: 3,
+                generated_by: "pinset 1.5.0".to_owned(),
+                tools: vec![tool],
+            };
 
-        validate_lockfile(&lockfile).expect("schema 3 accepts a selector");
-        assert_eq!(
-            validate_lock_matches_selection(&lockfile, "24", Path::new("pinset.toml"))
-                .expect("selector matches")
-                .version,
-            "24.0.0"
-        );
+            validate_lockfile(&lockfile)
+                .unwrap_or_else(|error| panic!("schema 3 rejected {name} selector: {error}"));
+            assert_eq!(
+                validate_lock_matches_tool(&lockfile, name, requested, Path::new("pinset.toml"),)
+                    .unwrap_or_else(|error| panic!("{name} selector mismatch: {error}"))
+                    .version,
+                resolved
+            );
 
-        lockfile.schema = 2;
-        assert!(matches!(
-            validate_lockfile(&lockfile),
-            Err(Error::InvalidLockfile { .. })
-        ));
+            lockfile.schema = 2;
+            assert!(
+                matches!(
+                    validate_lockfile(&lockfile),
+                    Err(Error::InvalidLockfile { .. })
+                ),
+                "schema 2 unexpectedly accepted {name} selector"
+            );
+        }
     }
 
     #[test]
@@ -1318,7 +1967,7 @@ mod tests {
     }
 
     #[test]
-    fn validates_go_provider_identity_and_required_targets() {
+    fn validates_go_provider_identity_and_partial_targets() {
         let artifacts = GO_TARGETS
             .into_iter()
             .map(|target| locked_go_artifact("1.25.1", target))
@@ -1330,6 +1979,7 @@ mod tests {
             provider: "go-official".to_owned(),
             released_at: None,
             metadata: BTreeMap::new(),
+            options: Default::default(),
             artifacts: artifacts.clone(),
         };
         validate_locked_tool(&tool).expect("Go lock");
@@ -1348,16 +1998,14 @@ mod tests {
             provider: "go-official".to_owned(),
             released_at: None,
             metadata: BTreeMap::new(),
+            options: Default::default(),
             artifacts: artifacts.into_iter().skip(1).collect(),
         };
-        assert!(matches!(
-            validate_locked_tool(&incomplete),
-            Err(Error::InvalidLockfile { .. })
-        ));
+        validate_locked_tool(&incomplete).expect("partial Go lock");
     }
 
     #[test]
-    fn validates_flutter_provider_metadata_identity_and_required_targets() {
+    fn validates_flutter_provider_metadata_identity_and_partial_targets() {
         let artifacts = FLUTTER_TARGETS
             .into_iter()
             .map(|target| locked_flutter_artifact("3.47.0", target))
@@ -1373,6 +2021,7 @@ mod tests {
             provider: "flutter-official".to_owned(),
             released_at: None,
             metadata,
+            options: Default::default(),
             artifacts: artifacts.clone(),
         };
         validate_locked_tool(&tool).expect("Flutter lock");
@@ -1397,14 +2046,11 @@ mod tests {
 
         let mut incomplete = tool;
         incomplete.artifacts = artifacts.into_iter().skip(1).collect();
-        assert!(matches!(
-            validate_locked_tool(&incomplete),
-            Err(Error::InvalidLockfile { .. })
-        ));
+        validate_locked_tool(&incomplete).expect("partial Flutter lock");
     }
 
     #[test]
-    fn validates_python_distribution_metadata_and_required_targets() {
+    fn validates_python_distribution_metadata_and_partial_targets() {
         let distribution = "3.14.7+20260807";
         let artifacts = PYTHON_TARGETS
             .into_iter()
@@ -1426,6 +2072,7 @@ mod tests {
             provider: "python-build-standalone".to_owned(),
             released_at: None,
             metadata,
+            options: Default::default(),
             artifacts: artifacts.clone(),
         };
         validate_locked_tool(&tool).expect("Python lock");
@@ -1441,14 +2088,60 @@ mod tests {
 
         let mut incomplete = tool;
         incomplete.artifacts = artifacts.into_iter().skip(1).collect();
+        validate_locked_tool(&incomplete).expect("partial Python lock");
+    }
+
+    #[test]
+    fn validates_official_python_archive_and_msi_bundle_identity() {
+        let artifact = LockedArtifact {
+            target: "windows-x86_64".to_owned(),
+            canonical_url: "https://www.python.org/ftp/python/3.12.10/amd64/lib.msi".to_owned(),
+            artifact_path: "3.12.10/amd64/lib.msi".to_owned(),
+            sha256: "a".repeat(64),
+            integrity: None,
+            format: LockedArtifactFormat::Binary,
+            archive_root: String::new(),
+            verification: "python-org-https-sha256".to_owned(),
+            overlays: ["core.msi", "exe.msi"]
+                .into_iter()
+                .map(|name| LockedArtifactOverlay {
+                    canonical_url: format!(
+                        "https://www.python.org/ftp/python/3.12.10/amd64/{name}"
+                    ),
+                    artifact_path: format!("3.12.10/amd64/{name}"),
+                    integrity: format!("sha256:{}", "b".repeat(64)),
+                    format: LockedArtifactFormat::Binary,
+                    archive_root: String::new(),
+                    verification: "python-org-https-sha256".to_owned(),
+                })
+                .collect(),
+        };
+        let tool = LockedTool {
+            name: "python".to_owned(),
+            requested: "3.12".to_owned(),
+            version: "3.12.10".to_owned(),
+            provider: "python.org-cpython".to_owned(),
+            released_at: Some("2025-04-08T14:08:52Z".to_owned()),
+            metadata: BTreeMap::from([
+                ("distribution".to_owned(), "python.org/cpython".to_owned()),
+                ("install_kind".to_owned(), "msi-bundle".to_owned()),
+                ("python_version".to_owned(), "3.12.10".to_owned()),
+            ]),
+            options: Default::default(),
+            artifacts: vec![artifact],
+        };
+        validate_locked_tool(&tool).expect("official Python MSI bundle lock");
+
+        let mut invalid = tool;
+        invalid.artifacts[0].canonical_url = "https://example.invalid/lib.msi".to_owned();
         assert!(matches!(
-            validate_locked_tool(&incomplete),
+            validate_locked_tool(&invalid),
             Err(Error::InvalidLockfile { .. })
         ));
     }
 
     #[test]
-    fn validates_temurin_metadata_signatures_and_required_targets() {
+    fn validates_temurin_metadata_signatures_and_partial_targets() {
         let version = "21.0.8+9";
         let release_name = "jdk-21.0.8+9";
         let artifacts = JAVA_TARGETS
@@ -1479,9 +2172,33 @@ mod tests {
             provider: "adoptium-temurin".to_owned(),
             released_at: None,
             metadata,
+            options: Default::default(),
             artifacts: artifacts.clone(),
         };
         validate_locked_tool(&tool).expect("Java lock");
+
+        let jre_artifacts = JAVA_TARGETS
+            .into_iter()
+            .map(|target| locked_java_artifact_for(version, release_name, target, "jre"))
+            .collect::<Vec<_>>();
+        let mut jre = tool.clone();
+        jre.metadata
+            .insert("image_type".to_owned(), "jre".to_owned());
+        jre.metadata
+            .retain(|key, _| !key.starts_with("signature_link."));
+        for artifact in &jre_artifacts {
+            jre.metadata.insert(
+                format!("signature_link.{}", artifact.target),
+                format!("{}.sig", artifact.canonical_url),
+            );
+        }
+        jre.options = BTreeMap::from([
+            ("distribution".to_owned(), "temurin".to_owned()),
+            ("package".to_owned(), "jre".to_owned()),
+        ]);
+        jre.artifacts = jre_artifacts;
+        validate_locked_tool(&jre).expect("Temurin JRE lock");
+        assert_ne!(tool.installation_version(), jre.installation_version());
 
         let mut invalid_signature = tool.clone();
         invalid_signature.metadata.insert(
@@ -1495,14 +2212,14 @@ mod tests {
 
         let mut incomplete = tool;
         incomplete.artifacts = artifacts.into_iter().skip(1).collect();
-        assert!(matches!(
-            validate_locked_tool(&incomplete),
-            Err(Error::InvalidLockfile { .. })
-        ));
+        incomplete
+            .metadata
+            .retain(|key, _| !key.starts_with("signature_link.windows-x86_64"));
+        validate_locked_tool(&incomplete).expect("partial Java lock");
     }
 
     #[test]
-    fn validates_official_rust_manifest_identity_and_required_targets() {
+    fn validates_official_rust_manifest_identity_and_partial_targets() {
         let version = "1.97.1";
         let date = "2026-07-16";
         let artifacts = RUST_TARGETS
@@ -1522,9 +2239,25 @@ mod tests {
                 ("manifest_sha256".to_owned(), "ab".repeat(32)),
                 ("profile".to_owned(), RUST_PROFILE.to_owned()),
             ]),
+            options: Default::default(),
             artifacts: artifacts.clone(),
         };
         validate_locked_tool(&tool).expect("Rust lock");
+        assert_eq!(tool.installation_version(), version);
+
+        let mut minimal = tool.clone();
+        minimal
+            .options
+            .insert("profile".to_owned(), "minimal".to_owned());
+        let mut complete = tool.clone();
+        complete
+            .options
+            .insert("profile".to_owned(), "complete".to_owned());
+        assert_ne!(minimal.installation_version(), version);
+        assert_ne!(
+            minimal.installation_version(),
+            complete.installation_version()
+        );
 
         let mut invalid = tool.clone();
         invalid.artifacts[0].canonical_url = "https://example.invalid/rust.tar.xz".to_owned();
@@ -1535,14 +2268,43 @@ mod tests {
 
         let mut incomplete = tool;
         incomplete.artifacts = artifacts.into_iter().skip(1).collect();
-        assert!(matches!(
-            validate_locked_tool(&incomplete),
-            Err(Error::InvalidLockfile { .. })
-        ));
+        validate_locked_tool(&incomplete).expect("partial Rust lock");
     }
 
     #[test]
-    fn validates_official_dotnet_sdk_metadata_and_required_targets() {
+    fn validates_fixed_date_nightly_with_extra_compilation_targets() {
+        let version = "1.98.0";
+        let date = "2026-07-16";
+        let target = "wasm32-unknown-unknown";
+        let artifacts = RUST_TARGETS
+            .into_iter()
+            .map(|platform| locked_rust_nightly_artifact(version, date, platform, target))
+            .collect::<Vec<_>>();
+        let tool = LockedTool {
+            name: "rust".to_owned(),
+            requested: format!("nightly-{date}"),
+            version: version.to_owned(),
+            provider: "rust-official".to_owned(),
+            released_at: None,
+            metadata: BTreeMap::from([
+                ("channel".to_owned(), "nightly".to_owned()),
+                ("components".to_owned(), RUST_COMPONENTS.to_owned()),
+                ("manifest_date".to_owned(), date.to_owned()),
+                ("manifest_sha256".to_owned(), "ab".repeat(32)),
+                ("profile".to_owned(), RUST_PROFILE.to_owned()),
+            ]),
+            options: BTreeMap::from([
+                ("date".to_owned(), date.to_owned()),
+                ("targets".to_owned(), target.to_owned()),
+            ]),
+            artifacts,
+        };
+
+        validate_locked_tool(&tool).expect("nightly Rust lock");
+    }
+
+    #[test]
+    fn validates_official_dotnet_sdk_metadata_and_partial_targets() {
         let version = "10.0.400";
         let artifacts = DOTNET_TARGETS
             .into_iter()
@@ -1561,6 +2323,7 @@ mod tests {
                 ("release_version".to_owned(), "10.0.14".to_owned()),
                 ("support_phase".to_owned(), "active".to_owned()),
             ]),
+            options: Default::default(),
             artifacts: artifacts.clone(),
         };
         validate_locked_tool(&tool).expect(".NET SDK lock");
@@ -1569,17 +2332,11 @@ mod tests {
         invalid
             .metadata
             .insert("support_phase".to_owned(), "eol".to_owned());
-        assert!(matches!(
-            validate_locked_tool(&invalid),
-            Err(Error::InvalidLockfile { .. })
-        ));
+        validate_locked_tool(&invalid).expect("EOL .NET lock");
 
         let mut incomplete = tool;
         incomplete.artifacts = artifacts.into_iter().skip(1).collect();
-        assert!(matches!(
-            validate_locked_tool(&incomplete),
-            Err(Error::InvalidLockfile { .. })
-        ));
+        validate_locked_tool(&incomplete).expect("partial .NET lock");
     }
 
     fn locked_artifact(target: &str) -> LockedArtifact {
@@ -1608,7 +2365,149 @@ mod tests {
             provider: "pnpm-npm".to_owned(),
             released_at: None,
             metadata: BTreeMap::new(),
+            options: Default::default(),
             artifacts: vec![artifact],
+        }
+    }
+
+    fn locked_current_provider_tool(name: &str) -> LockedTool {
+        match name {
+            "node" => Lockfile::new_node(
+                "pinset test".to_owned(),
+                "24.0.0".to_owned(),
+                "5BE8A3F6C8A5C01D106C0AD820B1A390B168D356".to_owned(),
+                "official".to_owned(),
+                MVP_NODE_TARGETS.into_iter().map(locked_artifact).collect(),
+            )
+            .tools
+            .remove(0),
+            "pnpm" => locked_npm_tool("pnpm", "11.21.0", true),
+            "bun" => locked_npm_tool("bun", "1.3.14", true),
+            "go" => LockedTool {
+                name: "go".to_owned(),
+                requested: "1.25.1".to_owned(),
+                version: "1.25.1".to_owned(),
+                provider: "go-official".to_owned(),
+                released_at: None,
+                metadata: BTreeMap::new(),
+                options: Default::default(),
+                artifacts: GO_TARGETS
+                    .into_iter()
+                    .map(|target| locked_go_artifact("1.25.1", target))
+                    .collect(),
+            },
+            "flutter" => LockedTool {
+                name: "flutter".to_owned(),
+                requested: "3.47.0".to_owned(),
+                version: "3.47.0".to_owned(),
+                provider: "flutter-official".to_owned(),
+                released_at: None,
+                metadata: BTreeMap::from([
+                    ("channel".to_owned(), "stable".to_owned()),
+                    ("dart_version".to_owned(), "3.13.0".to_owned()),
+                    ("release_hash".to_owned(), "cd".repeat(20)),
+                ]),
+                options: Default::default(),
+                artifacts: FLUTTER_TARGETS
+                    .into_iter()
+                    .map(|target| locked_flutter_artifact("3.47.0", target))
+                    .collect(),
+            },
+            "python" => LockedTool {
+                name: "python".to_owned(),
+                requested: "3.14.7+20260807".to_owned(),
+                version: "3.14.7+20260807".to_owned(),
+                provider: "python-build-standalone".to_owned(),
+                released_at: None,
+                metadata: BTreeMap::from([
+                    ("build_id".to_owned(), "20260807".to_owned()),
+                    (
+                        "distribution".to_owned(),
+                        "astral-sh/python-build-standalone".to_owned(),
+                    ),
+                    ("python_version".to_owned(), "3.14.7".to_owned()),
+                    ("variant".to_owned(), PYTHON_VARIANT.to_owned()),
+                ]),
+                options: Default::default(),
+                artifacts: PYTHON_TARGETS
+                    .into_iter()
+                    .map(|target| locked_python_artifact("3.14.7+20260807", target))
+                    .collect(),
+            },
+            "java" => {
+                let version = "21.0.8+9";
+                let release_name = "jdk-21.0.8+9";
+                let artifacts = JAVA_TARGETS
+                    .into_iter()
+                    .map(|target| locked_java_artifact(version, release_name, target))
+                    .collect::<Vec<_>>();
+                let mut metadata = BTreeMap::from([
+                    ("distribution".to_owned(), "eclipse-temurin".to_owned()),
+                    ("vendor".to_owned(), "eclipse".to_owned()),
+                    ("image_type".to_owned(), "jdk".to_owned()),
+                    ("jvm_impl".to_owned(), "hotspot".to_owned()),
+                    ("heap_size".to_owned(), "normal".to_owned()),
+                    ("release_type".to_owned(), "ga".to_owned()),
+                    ("feature_version".to_owned(), "21".to_owned()),
+                    ("release_name".to_owned(), release_name.to_owned()),
+                    ("openjdk_version".to_owned(), "21.0.8+9-LTS".to_owned()),
+                ]);
+                for artifact in &artifacts {
+                    metadata.insert(
+                        format!("signature_link.{}", artifact.target),
+                        format!("{}.sig", artifact.canonical_url),
+                    );
+                }
+                LockedTool {
+                    name: "java".to_owned(),
+                    requested: version.to_owned(),
+                    version: version.to_owned(),
+                    provider: "adoptium-temurin".to_owned(),
+                    released_at: None,
+                    metadata,
+                    options: Default::default(),
+                    artifacts,
+                }
+            }
+            "rust" => LockedTool {
+                name: "rust".to_owned(),
+                requested: "1.97.1".to_owned(),
+                version: "1.97.1".to_owned(),
+                provider: "rust-official".to_owned(),
+                released_at: None,
+                metadata: BTreeMap::from([
+                    ("channel".to_owned(), "stable".to_owned()),
+                    ("components".to_owned(), RUST_COMPONENTS.to_owned()),
+                    ("manifest_date".to_owned(), "2026-07-16".to_owned()),
+                    ("manifest_sha256".to_owned(), "ab".repeat(32)),
+                    ("profile".to_owned(), RUST_PROFILE.to_owned()),
+                ]),
+                options: Default::default(),
+                artifacts: RUST_TARGETS
+                    .into_iter()
+                    .map(|target| locked_rust_artifact("1.97.1", "2026-07-16", target))
+                    .collect(),
+            },
+            "dotnet" => LockedTool {
+                name: "dotnet".to_owned(),
+                requested: "10.0.400".to_owned(),
+                version: "10.0.400".to_owned(),
+                provider: "microsoft-dotnet-sdk".to_owned(),
+                released_at: None,
+                metadata: BTreeMap::from([
+                    ("channel".to_owned(), "10.0".to_owned()),
+                    ("release_date".to_owned(), "2026-08-11".to_owned()),
+                    ("release_type".to_owned(), "lts".to_owned()),
+                    ("release_version".to_owned(), "10.0.14".to_owned()),
+                    ("support_phase".to_owned(), "active".to_owned()),
+                ]),
+                options: Default::default(),
+                artifacts: DOTNET_TARGETS
+                    .into_iter()
+                    .map(|target| locked_dotnet_artifact("10.0.400", target))
+                    .collect(),
+            },
+            other => panic!("unsupported provider fixture {other}"),
         }
     }
 
@@ -1666,6 +2565,15 @@ mod tests {
     }
 
     fn locked_java_artifact(version: &str, release_name: &str, target: &str) -> LockedArtifact {
+        locked_java_artifact_for(version, release_name, target, "jdk")
+    }
+
+    fn locked_java_artifact_for(
+        version: &str,
+        release_name: &str,
+        target: &str,
+        image_type: &str,
+    ) -> LockedArtifact {
         let (os, arch, extension) = match target {
             "windows-x86_64" => ("windows", "x64", "zip"),
             "linux-x86_64" => ("linux", "x64", "tar.gz"),
@@ -1674,14 +2582,21 @@ mod tests {
             "macos-aarch64" => ("mac", "aarch64", "tar.gz"),
             _ => unreachable!("known Java target"),
         };
-        let package = format!("OpenJDK21U-jdk_{arch}_{os}_hotspot_21.0.8_9.{extension}");
+        let package = format!("OpenJDK21U-{image_type}_{arch}_{os}_hotspot_21.0.8_9.{extension}");
         let canonical_url = format!(
             "https://github.com/adoptium/temurin21-binaries/releases/download/{}/{}",
             release_name.replace('+', "%2B"),
             package,
         );
-        let plan = plan_java_artifact(version, release_name, target, &package, &canonical_url)
-            .expect("Java plan");
+        let plan = crate::plan_java_artifact_with_package(
+            version,
+            release_name,
+            target,
+            image_type,
+            &package,
+            &canonical_url,
+        )
+        .expect("Java plan");
         LockedArtifact {
             target: target.to_owned(),
             canonical_url: plan.canonical_url,
@@ -1716,6 +2631,38 @@ mod tests {
         }
     }
 
+    fn locked_rust_nightly_artifact(
+        version: &str,
+        date: &str,
+        platform: &str,
+        compilation_target: &str,
+    ) -> LockedArtifact {
+        let triple = crate::rust_target_triple(platform).expect("Rust target triple");
+        let canonical_url =
+            format!("https://static.rust-lang.org/dist/{date}/rust-nightly-{triple}.tar.xz");
+        let plan = plan_rust_nightly_artifact(version, date, platform, &canonical_url)
+            .expect("Rust nightly plan");
+        let overlay_name = format!("rust-std-nightly-{compilation_target}.tar.xz");
+        LockedArtifact {
+            target: platform.to_owned(),
+            canonical_url: plan.canonical_url,
+            artifact_path: plan.artifact_path,
+            sha256: "ab".repeat(32),
+            integrity: None,
+            format: LockedArtifactFormat::TarXz,
+            archive_root: plan.archive_root,
+            verification: "rust-v2-manifest-sha256".to_owned(),
+            overlays: vec![LockedArtifactOverlay {
+                canonical_url: format!("https://static.rust-lang.org/dist/{date}/{overlay_name}"),
+                artifact_path: format!("dist/{date}/{overlay_name}"),
+                integrity: format!("sha256:{}", "cd".repeat(32)),
+                format: LockedArtifactFormat::TarXz,
+                archive_root: format!("rust-std-nightly-{compilation_target}"),
+                verification: "rust-v2-manifest-sha256".to_owned(),
+            }],
+        }
+    }
+
     fn locked_dotnet_artifact(version: &str, target: &str) -> LockedArtifact {
         let (rid, extension) = match target {
             "windows-x86_64" => ("win-x64", "zip"),
@@ -1746,9 +2693,40 @@ mod tests {
     }
 
     fn locked_pnpm_artifact(version: &str, with_overlay: bool) -> LockedArtifact {
-        let artifact_path = format!("@pnpm/linux-x64/-/linux-x64-{version}.tgz");
+        locked_npm_artifact("pnpm", version, "linux-x86_64", with_overlay)
+    }
+
+    fn locked_npm_tool(tool: &str, version: &str, include_linux_arm64: bool) -> LockedTool {
+        LockedTool {
+            name: tool.to_owned(),
+            requested: version.to_owned(),
+            version: version.to_owned(),
+            provider: format!("{tool}-npm"),
+            released_at: None,
+            metadata: BTreeMap::new(),
+            options: Default::default(),
+            artifacts: npm_tool_targets(tool)
+                .iter()
+                .filter(|(target, _)| include_linux_arm64 || *target != "linux-aarch64")
+                .map(|(target, _)| locked_npm_artifact(tool, version, target, tool == "pnpm"))
+                .collect(),
+        }
+    }
+
+    fn locked_npm_artifact(
+        tool: &str,
+        version: &str,
+        target: &str,
+        with_overlay: bool,
+    ) -> LockedArtifact {
+        let package = npm_tool_targets(tool)
+            .iter()
+            .find_map(|(candidate, package)| (*candidate == target).then_some(*package))
+            .expect("known npm target");
+        let package_base = package.rsplit('/').next().expect("npm package");
+        let artifact_path = format!("{package}/-/{package_base}-{version}.tgz");
         LockedArtifact {
-            target: "linux-x86_64".to_owned(),
+            target: target.to_owned(),
             canonical_url: format!("https://registry.npmjs.org/{artifact_path}"),
             artifact_path,
             sha256: String::new(),
@@ -1756,7 +2734,7 @@ mod tests {
             format: LockedArtifactFormat::TarGz,
             archive_root: "package".to_owned(),
             verification: "npm-registry-signature-sha512".to_owned(),
-            overlays: with_overlay
+            overlays: (tool == "pnpm" && with_overlay)
                 .then(|| {
                     let artifact_path = format!("@pnpm/exe/-/exe-{version}.tgz");
                     LockedArtifactOverlay {

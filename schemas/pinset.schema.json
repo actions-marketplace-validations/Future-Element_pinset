@@ -7,7 +7,16 @@
   "additionalProperties": false,
   "required": ["schema", "project-id", "tools"],
   "properties": {
-    "schema": { "const": 4 },
+    "schema": { "enum": [5, 6] },
+    "requirements": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "platforms": { "type": "array", "uniqueItems": true, "maxItems": 5, "items": { "enum": ["windows-x86_64", "linux-x86_64", "linux-aarch64", "macos-x86_64", "macos-aarch64"] } },
+        "build-targets": { "type": "array", "uniqueItems": true, "maxItems": 5, "items": { "enum": ["android", "ios", "macos", "windows", "linux"] } },
+        "disabled-rules": { "type": "array", "uniqueItems": true, "maxItems": 64, "items": { "type": "string", "maxLength": 160, "pattern": "^(compatibility|build)\\.[A-Za-z0-9._/-]+$" } }
+      }
+    },
     "project-id": {
       "type": "string",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
@@ -43,6 +52,104 @@
         "dotnet": { "$ref": "#/$defs/selector" }
       }
     },
+    "tool-options": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rust": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "profile": { "enum": ["minimal", "default", "complete"] },
+            "components": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+            "targets": { "type": "array", "uniqueItems": true, "items": { "type": "string", "minLength": 1 } },
+            "date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" }
+          }
+        },
+        "java": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "distribution": { "const": "temurin" },
+            "package": { "enum": ["jdk", "jre"] }
+          }
+        }
+      }
+    },
+    "tasks": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/taskName" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command"],
+        "properties": {
+          "command": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "depends-on": {
+            "type": "array",
+            "maxItems": 64,
+            "uniqueItems": true,
+            "items": { "$ref": "#/$defs/taskName" }
+          },
+          "cwd": {
+            "type": "string",
+            "minLength": 1,
+            "not": { "pattern": "(^|[\\\\/])\\.\\.([\\\\/]|$)" }
+          },
+          "profile": { "$ref": "#/$defs/profileName" },
+          "description": { "type": "string" },
+          "python-environment": { "$ref": "#/$defs/pythonEnvironmentName" }
+        }
+      }
+    },
+    "python": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "environments": {
+          "type": "object",
+          "propertyNames": {
+            "allOf": [
+              { "$ref": "#/$defs/pythonEnvironmentName" },
+              { "not": { "const": "default" } }
+            ]
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path"],
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "not": { "pattern": "(^|[\\\\/])\\.\\.([\\\\/]|$)" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["members"],
+      "properties": {
+        "members": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?![./])(?!.*/(?:\\.|\\.\\.)(?:/|$))[^\\\\:]+$"
+          }
+        }
+      }
+    },
     "environment": {
       "type": "object",
       "additionalProperties": false,
@@ -69,13 +176,56 @@
               }
             }
           }
+        },
+        "variables": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^(?!PATH$)(?!PINSET_)[A-Za-z_][A-Za-z0-9_]*$"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "enum": ["string", "integer", "boolean", "url", "enum"],
+                "default": "string"
+              },
+              "required": { "type": "boolean", "default": false },
+              "secret": { "type": "boolean", "default": false },
+              "default": { "type": "string" },
+              "profiles": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": { "$ref": "#/$defs/profileName" }
+              },
+              "values": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": { "type": "string" }
+              },
+              "description": { "type": "string" }
+            }
+          }
         }
       }
     }
   },
+  "allOf": [{ "if": { "required": ["requirements"] }, "then": { "properties": { "schema": { "const": 6 } } } }],
   "$defs": {
     "selector": { "type": "string", "minLength": 1 },
     "profileName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "taskName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "pythonEnvironmentName": {
       "type": "string",
       "minLength": 1,
       "maxLength": 64,

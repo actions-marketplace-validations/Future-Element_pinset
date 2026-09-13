@@ -32,6 +32,7 @@ jobs:
       validation_required: ${{ steps.classify.outputs.validation_required }}
       code_changed: ${{ steps.classify.outputs.code_changed }}
       cargo_changed: ${{ steps.classify.outputs.cargo_changed }}
+      extension_changed: ${{ steps.classify.outputs.extension_changed }}
       website_changed: ${{ steps.classify.outputs.website_changed }}
     steps:
       - name: Check out repository
@@ -52,6 +53,7 @@ jobs:
           validation_required=true
           code_changed=true
           cargo_changed=true
+          extension_changed=true
           website_changed=true
 
           if [[ "${EVENT_NAME}" == "pull_request" && "${IS_DRAFT}" == "true" ]]; then
@@ -77,6 +79,7 @@ jobs:
           if [[ "${EVENT_NAME}" == "schedule" ]]; then
             code_changed=false
             cargo_changed=true
+            extension_changed=false
             website_changed=false
           elif [[ "${EVENT_NAME}" != "workflow_dispatch" ]]; then
             if [[ -n "${BASE_SHA}" && "${BASE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
@@ -87,6 +90,7 @@ jobs:
 
             code_changed=false
             cargo_changed=false
+            extension_changed=false
             website_changed=false
             while IFS= read -r changed_file; do
               [[ -z "${changed_file}" ]] && continue
@@ -106,6 +110,12 @@ jobs:
               esac
 
               case "${changed_file}" in
+                editors/vscode/*|.github/workflows/ci.yml|.github/workflows/release-preflight.yml|.github/workflows/release.yml)
+                  extension_changed=true
+                  ;;
+              esac
+
+              case "${changed_file}" in
                 website/*|docs/commands.md|docs/commands.zh-CN.md|.github/workflows/ci.yml|.github/workflows/release-preflight.yml|.github/workflows/release.yml)
                   website_changed=true
                   ;;
@@ -117,12 +127,14 @@ jobs:
             echo "validation_required=${validation_required}"
             echo "code_changed=${code_changed}"
             echo "cargo_changed=${cargo_changed}"
+            echo "extension_changed=${extension_changed}"
             echo "website_changed=${website_changed}"
           } >> "${GITHUB_OUTPUT}"
 
           echo "validation_required=${validation_required}"
           echo "code_changed=${code_changed}"
           echo "cargo_changed=${cargo_changed}"
+          echo "extension_changed=${extension_changed}"
           echo "website_changed=${website_changed}"
 
   security:
@@ -212,6 +224,20 @@ jobs:
         continue-on-error: true
         run: cargo fmt --all -- --check
 
+      - name: Prepare formatting fix for contributors
+        if: steps.formatting.outcome == 'failure'
+        run: |
+          cargo fmt --all
+          git diff --binary > formatting.patch
+
+      - name: Upload formatting fix
+        if: steps.formatting.outcome == 'failure'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: formatting-fix
+          path: formatting.patch
+          retention-days: 3
+
       - name: Run Clippy
         id: clippy
         continue-on-error: true
@@ -267,12 +293,14 @@ jobs:
         include:
           - os: ubuntu-24.04
             artifact: pinset-linux-x86_64
+          - os: ubuntu-24.04-arm
+            artifact: pinset-linux-aarch64
           - os: windows-2025
             artifact: pinset-windows-x86_64
           - os: macos-15
             artifact: pinset-macos-aarch64
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Propagate prerequisite failures
         shell: bash
@@ -307,6 +335,48 @@ jobs:
 
       - name: Link development binaries
         run: cargo build --locked -p pinset-cli -p pinset-shim
+
+      - name: Prepare native terminal and credential-store acceptance
+        shell: bash
+        run: |
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            # 3.x has reported ConPTY read/write stalls (andfoy/pywinpty#545).
+            # Keep the native terminal fixture on the compatible pre-3.x transport.
+            python -m pip install --only-binary=:all: pywinpty==2.0.15
+          elif [[ "${RUNNER_OS}" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y gnome-keyring dbus-x11
+          fi
+
+      - name: Validate native execution and local environments
+        shell: bash
+        run: |
+          cargo test --locked -p pinset-cli --test short_execution_cli --test python_cli
+          cargo test --locked -p pinset-shim
+          suffix=""
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then suffix=".exe"; fi
+          PINSET_TEST_SHIM="${GITHUB_WORKSPACE}/target/debug/pinset-shim${suffix}" \
+            cargo test --locked -p pinset-cli --test short_execution_cli paired_shim_uses -- --ignored
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then
+            dbus-run-session -- sh -c 'printf "%s" "disposable-ci-keyring" | gnome-keyring-daemon --unlock --components=secrets; python3 scripts/tests/environment_wizard_test.py target/debug/pinset --keyring'
+          else
+            python scripts/tests/environment_wizard_test.py "target/debug/pinset${suffix}" --keyring
+          fi
+
+      - name: Validate real Node and Python environment preparation
+        shell: bash
+        run: |
+          suffix=""
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then suffix=".exe"; fi
+          npm ci --prefix editors/vscode
+          npm run compile --prefix editors/vscode
+          npm install --prefix "${RUNNER_TEMP}/pinset-editor-test" --no-audit --no-fund @vscode/test-electron@3.1.0
+          export PINSET_EDITOR_TEST_MODULES="${RUNNER_TEMP}/pinset-editor-test/node_modules"
+          if [[ "${RUNNER_OS}" == "Linux" ]]; then
+            xvfb-run -a python scripts/tests/environment_setup_test.py "target/debug/pinset${suffix}"
+          else
+            python scripts/tests/environment_setup_test.py "target/debug/pinset${suffix}"
+          fi
 
   website:
     name: Validate documentation website
@@ -346,6 +416,39 @@ jobs:
         shell: bash
         run: if grep -R --exclude='404.html' --exclude='_not-found*' --exclude-dir='_not-found' "http://localhost:3000" out; then exit 1; fi
 
+  extension:
+    name: Validate VS Code extension
+    needs: changes
+    if: >-
+      ${{
+        needs.changes.outputs.validation_required == 'true' &&
+        needs.changes.outputs.extension_changed == 'true'
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install locked extension dependencies
+        run: npm ci
+
+      - name: Type-check, test, and package extension
+        run: npm run package
+
+      - name: Inspect packaged files
+        shell: bash
+        run: |
+          unzip -l dist/pinset-vscode.vsix > vsix-files.txt
+          grep -F 'extension/dist/extension.js' vsix-files.txt
+          if grep -E 'extension/(src|test|node_modules)/' vsix-files.txt; then
+            echo "VSIX contains development files" >&2
+            exit 1
+          fi
+
   gate:
     name: CI Gate
     needs:
@@ -353,6 +456,7 @@ jobs:
       - security
       - quality
       - build
+      - extension
       - website
     if: always()
     runs-on: ubuntu-24.04
@@ -364,6 +468,8 @@ jobs:
           BUILD_RESULT: ${{ needs.build.result }}
           CHANGES_RESULT: ${{ needs.changes.result }}
           CODE_CHANGED: ${{ needs.changes.outputs.code_changed }}
+          EXTENSION_CHANGED: ${{ needs.changes.outputs.extension_changed }}
+          EXTENSION_RESULT: ${{ needs.extension.result }}
           QUALITY_RESULT: ${{ needs.quality.result }}
           SECURITY_RESULT: ${{ needs.security.result }}
           WEBSITE_CHANGED: ${{ needs.changes.outputs.website_changed }}
@@ -384,6 +490,10 @@ jobs:
           fi
           if [[ "${WEBSITE_CHANGED}" == "true" && "${WEBSITE_RESULT}" != "success" ]]; then
             echo "Documentation website validation failed: ${WEBSITE_RESULT}" >&2
+            exit 1
+          fi
+          if [[ "${EXTENSION_CHANGED}" == "true" && "${EXTENSION_RESULT}" != "success" ]]; then
+            echo "VS Code extension validation failed: ${EXTENSION_RESULT}" >&2
             exit 1
           fi
           if [[ "${CODE_CHANGED}" != "true" ]]; then

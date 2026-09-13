@@ -1,5 +1,9 @@
 # Pinset
 
+<p align="center">
+  <img src="docs/assets/pinset-logo.png" alt="Pinset 标志" width="640" />
+</p>
+
 [English](README.md) | [简体中文](README.zh-CN.md)
 
 [![CI](https://github.com/Future-Element/pinset/actions/workflows/ci.yml/badge.svg)](https://github.com/Future-Element/pinset/actions/workflows/ci.yml)
@@ -8,7 +12,7 @@
 
 Pinset 是一个行为可预测、理解项目边界的多语言运行时版本管理器。
 
-它使用一份项目配置和一份精确锁文件管理 Node.js、pnpm、Bun、Go、Python、Java、Rust、.NET 与 Flutter/Dart。进入项目后可以直接运行 `node`、`python`、`cargo`、`flutter` 等命令；Pinset shim 会选择项目锁定的运行时，并在项目受信任时注入选定的 age 加密环境 profile。
+它使用一份项目配置和一份精确锁文件管理 Node.js、pnpm、Bun、Go、Python、Java、Rust、.NET、Flutter/Dart 与声明式开发 CLI。进入项目后可以直接运行 `node`、`python`、`cargo`、`flutter`、`jq` 等命令；Pinset shim 会选择项目锁定的运行时，并在项目受信任时注入选定的 age 加密环境 profile。
 
 ```text
 pinset.toml  ──用户意图、项目策略、环境 profile
@@ -41,8 +45,13 @@ pinset.toml  ──用户意图、项目策略、环境 profile
 | Rust stable | `rustc`、`cargo`、`rustdoc`、`rustfmt`、Clippy | ✓ | ✓ | ✓ | ✓ |
 | .NET SDK | `dotnet` | ✓ | ✓ | ✓ | ✓ |
 | Flutter / 内置 Dart | `flutter`、`dart` | ✓ | ✓ | — | ✓ |
+| jq（声明式） | `jq` | ✓ | ✓ | ✓ | ✓ |
 
 Flutter 没有提供符合当前安装模型的官方 Linux ARM64 SDK 归档，因此 Pinset 会明确返回不支持，而不会下载 x64 制品。外部 Android SDK、Visual Studio Build Tools、Windows SDK 等系统依赖只由 `doctor` 诊断，不由 Pinset 安装。
+
+默认解析遵循“语言/项目官方发布归档优先”。Node.js 使用 nodejs.org `dist`，Go 使用 go.dev 下载归档，Python 使用 python.org CPython 归档，Flutter 使用官方 Google Storage 发布索引，Rust 使用 static.rust-lang.org，.NET 使用 Microsoft 发布元数据，Java 使用 Eclipse Temurin 官方发行 API，pnpm 与 Bun 使用项目在 npm 官方注册表发布的独立可执行包。用户显式 `source use` 一个带 `--trust-metadata` 的 HTTPS 镜像后，顺序为“所选可信源 → 官方源 → 兼容发行物”；仅仅 `source add` 的其他源不会被访问。`source fallback` 只增加用户显式指定的制品下载重试，不参与元数据选择。
+
+Python 会先使用 python.org 的完整 ZIP、MSI 组件归档或历史单体 MSI；只有官方没有当前目标可用的隔离制品时，才回退到 `python-build-standalone`。Pinset 自行下载并校验制品，不调用 uv、pyenv、nvm 等外部版本管理器。Python 3.2 及更早版本没有标准库 `venv`，因此仍可选择和直接运行受管解释器，但不能创建 Pinset 项目虚拟环境。
 
 ## 安装目录是怎样组织的
 
@@ -72,6 +81,8 @@ pinset paths
 pinset paths flutter
 pinset list --long
 pinset doctor --deep
+pinset status --save diagnostic.json
+pinset check --compare diagnostic.json
 ```
 
 ## 安装
@@ -88,7 +99,7 @@ export PATH="$HOME/.local/bin:$PATH"
 安装指定版本或目录：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Future-Element/pinset/main/install.sh | sh -s -- --version 2.1.3
+curl -fsSL https://raw.githubusercontent.com/Future-Element/pinset/main/install.sh | sh -s -- --version 2.12.3
 PINSET_INSTALL_DIR=/opt/pinset/bin sh install.sh
 ```
 
@@ -103,7 +114,7 @@ Remove-Item .\install.ps1
 指定版本：
 
 ```powershell
-.\install.ps1 -Version 2.1.3
+.\install.ps1 -Version 2.12.3
 ```
 
 Windows 与 WSL 是两个独立环境，需要分别安装。安装器只安装 Pinset 和所有内置命令路由，不会预先下载语言运行时。
@@ -174,7 +185,7 @@ pnpm --version
 python --version
 ```
 
-`pinset.toml` 保存用户选择与策略，`pinset.lock` 保存精确版本和平台制品。项目配置使用 schema 4，运行时锁继续使用 schema 3；加密环境不会参与运行时制品解析。
+`pinset.toml` 保存用户选择、结构化工具选项、任务、环境变量契约与策略，`pinset.lock` 保存精确版本、选项和平台制品。项目配置与当前运行时锁均使用 schema 5；旧锁在显式迁移前继续可读。加密环境不会参与运行时制品解析。
 
 ### 3. 临时运行其他版本
 
@@ -195,12 +206,39 @@ pinset import
 
 `detect` 只读且不联网；`import` 不删除或修改来源文件。
 
+### 5. 把日常命令保存为任务
+
+任务使用参数数组，不使用 Shell 字符串，因此参数边界与子进程退出状态保持明确：
+
+```toml
+[tasks.prepare]
+command = ["pnpm", "install", "--frozen-lockfile"]
+
+[tasks.dev]
+command = ["pnpm", "dev"]
+profile = "development"
+description = "启动开发服务器"
+
+[tasks.test]
+command = ["pnpm", "test"]
+cwd = "packages/app"
+profile = "test"
+depends-on = ["prepare"]
+```
+
+```sh
+pinset run dev
+pinset run test -- --watch
+```
+
+环境优先级为显式 `-e`、`PINSET_ENV_PROFILE`、任务 profile、本机选择、项目默认值。任务不存在时直接报错，不会执行系统中的同名命令。
+
 ## 项目策略
 
 项目默认严格：未声明的工具不会继承全局选择，也不会静默使用系统命令。需要时在 `pinset.toml` 中显式调整：
 
 ```toml
-schema = 4
+schema = 5
 project-id = "4c5652e4-0000-4000-8000-000000000000"
 
 [policy]
@@ -281,10 +319,11 @@ jobs:
       PINSET_ENV_PROFILE: ci
     steps:
       - uses: actions/checkout@v4
-      - uses: Future-Element/pinset@v2.1.3
+      - uses: Future-Element/pinset@v2.12.3
         with:
-          version: 2.1.3
+          version: 2.12.3
           install: "true"
+          cache: "true"
           trust-project-id: "4c5652e4-0000-4000-8000-000000000000"
       - run: pinset exec -- node app.js
 ```
@@ -299,10 +338,15 @@ pinset current --explain
 pinset which node --explain
 pinset paths node
 pinset doctor --deep
+pinset check --repair-preview
 
 # 检查锁、缓存与安装所有权
 pinset lock audit --json
 pinset cache verify
+pinset cache prefetch --jobs 4
+pinset bundle export --output project.pinset-bundle.tar.gz
+pinset bundle import project.pinset-bundle.tar.gz
+pinset install --locked --offline
 
 # 修复具有匹配所有权收据的损坏安装
 pinset install node@24.0.0 --repair
@@ -310,7 +354,12 @@ pinset install node@24.0.0 --repair
 # 自更新不会在后台自动联网
 pinset self outdated
 pinset self update
+
+# 必要时显式迁移不兼容的旧全局锁
+pinset migrate --global
 ```
+
+`self outdated` 和 `self update` 通过 GitHub 公共 Release 重定向或 Atom 订阅发现已发布版本，不会调用有频率限制的 GitHub REST API。`self update` 会在下载前检查 `PINSET_HOME/state/global.lock`，并按原精确版本安全迁移 Node.js、pnpm、Bun、Go、Python、Java、Rust 与 .NET SDK 的已知 pre-1.0 记录。Flutter 的目标矩阵未变化。未知或损坏的锁结构会被拒绝，不会猜测迁移。
 
 `doctor --deep` 和安装收据验证的是安装布局、关键入口和统计信息，不宣称对每个已安装文件进行密码学验证。
 
@@ -342,7 +391,7 @@ pinset <命令> --help
 
 ## 迁移与升级
 
-旧项目升级到 schema 4 前可以先预览：
+旧项目升级到 schema 5 前可以先预览：
 
 ```sh
 pinset migrate --dry-run
@@ -383,7 +432,97 @@ pinset use --global node@lts pnpm@latest bun@latest go@latest python@3.14
 - 如果状态提交后安装失败，已成功安装的运行时保持有效，完整请求状态仍保留在锁文件中。错误会提示使用 `pinset install --locked` 或 `pinset install --global --locked` 重试；Pinset 不会假装已完成的文件系统安装可以原子回滚。
 - 帮助、命令补全、中英文命令文档和测试同时覆盖单选择兼容性与多选择行为。`install <tool@精确版本>` 仍是单个显式选择命令；基于锁的 `install --locked` 会安装完整作用域。
 
-更后续的 2.x 会在保持失败关闭和本地优先边界的前提下评估 KMS/OIDC、更广的平台制品和更强的来源证明。路线图不承诺具体版本或发布日期。
+### v2.2：短命令与本机环境
+
+Pinset **2.2.0** 简化了命令执行，并能记住当前机器上的项目环境：
+
+```sh
+pinset env init
+pinset env use dev
+pinset env set DATABASE_URL
+pinset -- pnpm dev
+pinset -e test -- pnpm test
+pinset -C ./another-project -- pnpm dev
+pinset env reset
+```
+
+`env use` 按项目路径和身份保存本机环境，worktree 互相隔离，CI 忽略本机偏好；`env share/unshare/members` 简化接收人操作。现有 `exec`、项目信任要求、配置和锁格式保持兼容。[命令文档](docs/commands.zh-CN.md#短执行入口22) 说明了选择优先级、非交互初始化和参数边界。2.2 不包含具名任务。
+
+### v2.3：任务与环境变量契约
+
+Pinset **2.3.0** 可以保存重复执行的项目流程，并在启动前检查环境是否就绪：
+
+```sh
+pinset run dev
+pinset run test -- --watch
+pinset env check --profile test
+pinset env diff development test
+```
+
+schema 5 增加 `[tasks.<名称>]` 与 `[environment.variables.<名称>]`。任务可以声明参数数组、项目内工作目录、profile、说明和 `depends-on` 列表。依赖按声明顺序在目标任务前各执行一次；依赖缺失或成环属于配置错误，首个非零退出会终止整个任务图。变量契约支持 `string`、`integer`、`boolean`、`url`、`enum`、必填、profile 过滤，以及非密钥变量的默认值。schema 4 项目继续可读可用，只有显式运行 `pinset migrate` 才会启用 schema 5。
+
+### Workspace 工作区
+
+schema 5 可以显式声明多个成员项目。成员共享根配置的默认值，同时各自保留独立的 `pinset.toml` 和 `pinset.lock`：
+
+```toml
+[workspace]
+members = ["apps/web", "services/api"]
+
+[tools]
+node = "24"
+```
+
+```sh
+pinset workspace members
+pinset workspace install
+pinset workspace check --changed-since origin/main
+pinset workspace run test -- --watch
+pinset workspace update
+pinset workspace references node
+```
+
+成员声明某个工具后，会整体替换该工具的根选择器及 `[tool-options.<tool>]`；数组不会跨层隐式合并。根任务与环境默认值会被继承，除非成员声明同名任务或完整的环境配置。批量更新仅生成预览，不修改成员锁文件。
+
+### 候选升级与恢复
+
+先准备并测试精确的候选工具链，期间不修改当前项目锁：
+
+```sh
+pinset candidate prepare
+pinset candidate test test
+pinset candidate apply
+pinset candidate history
+pinset candidate restore
+pinset candidate recover
+```
+
+为 `prepare`、`test`、`status` 或 `apply` 增加 `--workspace`，即可处理所有显式成员。候选记录绑定原始配置、有效配置、当前锁、项目身份、任务定义、Git HEAD 和工作区整洁状态。只有最新一次测试通过的精确候选锁可以应用；配置、锁或 Git 基线冲突时拒绝覆盖。恢复仅覆盖 Pinset 管理的锁状态，测试命令对业务文件或外部系统产生的副作用仍由项目自行处理。
+
+### 声明式 Provider
+
+Registry schema 2 可以安装通过 GitHub Release 发布平台二进制文件的开发 CLI。Provider 只声明固定仓库、目标与制品映射、校验和文件、命令和修订号，不能包含脚本、钩子、Shell 片段、任意 URL 或环境代码。`jq` 是首个完整使用通用后端的 Provider：
+
+```sh
+pinset use jq@1.8
+pinset -- jq --version
+pinset provider status
+pinset provider validate registry/providers.json
+pinset provider scaffold jq --repository jqlang/jq --command jq
+```
+
+Pinset 在路由命令前验证 Registry 签名、精确 Release 制品 URL、上游 SHA-256 文件、下载内容、安装收据和当前 Provider 修订号。`provider trust` 激活由 Pinset 固定签名者签署的快照，`provider untrust` 恢复使用二进制内嵌快照。签名修订可以禁用 Provider，已有锁随后会明确拒绝执行。
+
+### VS Code 集成
+
+[Pinset VS Code 扩展](editors/vscode/README.md)已发布到 [Visual Studio Marketplace](https://marketplace.visualstudio.com/items?itemName=FutureElement.pinset-vscode)。扩展读取版本化的 `pinset editor context --json` 协议，在底部状态栏显示 Pinset CLI 版本、已解析的工具链版本和当前项目环境。未初始化的文件夹会显示可一键执行的 `Pinset: Init`。它还在单根和多根工作区中提供诊断、环境选择、已声明任务和可取消的任务终端：
+
+```sh
+code --install-extension FutureElement.pinset-vscode
+pinset editor context --json
+```
+
+VS Code 将工作区标记为受信任前，扩展不会启动 Pinset 或项目进程。扩展使用上下文前会检查协议与最低扩展版本，隔离每个工作区文件夹的状态，并在取消任务终端时结束由该任务启动的进程树。
 
 ## 贡献与许可证
 

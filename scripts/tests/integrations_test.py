@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import json
+import ast
+import os
 import pathlib
 import re
 import subprocess
@@ -13,9 +15,13 @@ import tomllib
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+for script in ("scripts/verify_published_release.py", "scripts/tests/environment_wizard_test.py", "scripts/tests/team_delivery_test.py", "scripts/tests/sdk_versions_test.py", "scripts/environment_summary.py"):
+    ast.parse((ROOT / script).read_text(encoding="utf-8"), filename=script)
 WORKSPACE_VERSION = tomllib.loads((ROOT / "Cargo.toml").read_text(encoding="utf-8"))["workspace"][
     "package"
 ]["version"]
+DISTRIBUTION_VERSION = json.loads((ROOT / "release.json").read_text(encoding="utf-8"))["published"]
+subprocess.run([sys.executable, str(ROOT / "scripts/tests/release_version_test.py")], check=True)
 ARCHIVES = (
     "pinset-linux-x86_64.tar.gz",
     "pinset-linux-aarch64.tar.gz",
@@ -32,7 +38,7 @@ def require_text(path: pathlib.Path, values: tuple[str, ...]) -> None:
             raise AssertionError(f"{display} is missing {value!r}")
 
 
-for schema_name in ("pinset.schema.json", "pinset-lock.schema.json"):
+for schema_name in ("pinset.schema.json", "pinset-lock.schema.json", "diagnostic-report.schema.json", "environment-report-v2.schema.json", "bundle-manifest.schema.json"):
     schema = json.loads((ROOT / "schemas" / schema_name).read_text(encoding="utf-8"))
     assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
     assert schema["additionalProperties"] is False
@@ -40,7 +46,7 @@ for schema_name in ("pinset.schema.json", "pinset-lock.schema.json"):
 devcontainer = json.loads(
     (ROOT / "examples/devcontainer/.devcontainer/devcontainer.json").read_text(encoding="utf-8")
 )
-assert devcontainer["build"]["args"]["PINSET_VERSION"] == WORKSPACE_VERSION
+assert devcontainer["build"]["args"]["PINSET_VERSION"] == DISTRIBUTION_VERSION
 
 require_text(
     ROOT / "action.yml",
@@ -52,11 +58,14 @@ require_text(
         "pinset install --locked",
         "trust-project-id",
         "pinset trust add --project-id",
+        "actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
+        "pinset-action-home/downloads",
+        "pinset cache verify",
     ),
 )
 action = (ROOT / "action.yml").read_text(encoding="utf-8")
 action_version = re.search(r"(?ms)^  version:\s*$.*?^    default: ([^\s]+)$", action)
-assert action_version and action_version.group(1) == WORKSPACE_VERSION
+assert action_version and action_version.group(1) == DISTRIBUTION_VERSION
 require_text(
     ROOT / "integrations/renovate/pinset.json5",
     ("customType: \"regex\"", "datasource", "depName", "currentValue"),
@@ -70,6 +79,7 @@ require_text(
         "dist/pinset.rb",
         "dist/install.ps1",
         "dist/pinset-env.cdx.json",
+        "dist/pinset-vscode-*.vsix",
     ),
 )
 release_workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
@@ -88,13 +98,25 @@ require_text(
 website_package = json.loads((ROOT / "website/package.json").read_text(encoding="utf-8"))
 assert website_package["version"] == WORKSPACE_VERSION
 assert website_package["packageManager"] == "pnpm@10.15.0"
+extension_package = json.loads((ROOT / "editors/vscode/package.json").read_text(encoding="utf-8"))
+assert re.fullmatch(r"\d+\.\d+\.\d+", extension_package["version"])
+require_text(
+    ROOT / "editors/vscode/package.json",
+    (
+        "pinset.refresh",
+        "pinset.initializeProject",
+        "pinset.selectEnvironment",
+        "pinset.runTask",
+        "pinset.checkDiagnostics",
+    ),
+)
 require_text(
     ROOT / "examples/devcontainer/.devcontainer/Dockerfile",
-    (f"ARG PINSET_VERSION={WORKSPACE_VERSION}", "SHA256SUMS", "sha256sum"),
+    (f"ARG PINSET_VERSION={DISTRIBUTION_VERSION}", "SHA256SUMS", "sha256sum"),
 )
 
 install_ps1 = (ROOT / "install.ps1").read_text(encoding="utf-8")
-assert f"[string] $Version = '{WORKSPACE_VERSION}'" in install_ps1
+assert f"[string] $Version = '{DISTRIBUTION_VERSION}'" in install_ps1
 for required in ("Get-FileHash", "SHA256SUMS", "pinset-shim.exe", "shim install --all"):
     assert required in install_ps1
 
@@ -130,3 +152,19 @@ with tempfile.TemporaryDirectory() as temporary:
     )
 
 print(f"v{WORKSPACE_VERSION} integration contracts passed")
+
+with tempfile.TemporaryDirectory() as temporary:
+    root = pathlib.Path(temporary)
+    report = root / "report.json"
+    summary = root / "summary.md"
+    report.write_text(json.dumps({"schema": 2, "environment_ready": False, "execution_verified": False,
+        "project_root": "/private/path", "secret": "do-not-export-this-value", "runtimes": [
+            {"tool": "node", "locked_version": "24.0.0", "target": "linux-x86_64"},
+            {"tool": "[link](https://private.invalid)", "locked_version": "<script>", "target": "a|b"}]}))
+    subprocess.run([sys.executable, str(ROOT / "scripts/environment_summary.py"), str(report)],
+                   env=os.environ | {"GITHUB_STEP_SUMMARY": str(summary)}, check=True)
+    rendered = summary.read_text()
+    assert "node | 24.0.0 | linux-x86_64" in rendered
+    for value in ("/private/path", "do-not-export-this-value", "private.invalid", "<script>", "a|b"):
+        assert value not in rendered
+print("Environment summary privacy contract passed")

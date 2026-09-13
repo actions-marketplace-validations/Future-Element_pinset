@@ -146,15 +146,13 @@ impl Catalog {
                 format!("错误：Node.js 官方版本索引无效：{reason}")
             }
             Error::InvalidPythonVersion { version } => {
-                format!("错误：Python 精确发行版 {version:?} 无效，应为 x.y.z+YYYYMMDD")
+                format!("错误：Python 精确发行版 {version:?} 无效，应为 x.y.z 或 x.y.z+YYYYMMDD")
             }
             Error::InvalidPythonSelector { selector } => format!(
                 "错误：Python 选择器 {selector:?} 无效，可使用 x.y.z、主版本、主次版本、latest 或 current"
             ),
             Error::PythonSelectorNotFound { selector } => {
-                format!(
-                    "错误：官方注册表中没有与 {selector:?} 匹配且支持全部目标平台的稳定 Python 发行版"
-                )
+                format!("错误：Python 官方发布归档中没有与 {selector:?} 匹配的稳定版本")
             }
             Error::InvalidPythonIndex { reason } => {
                 format!("错误：Python 官方版本注册表无效：{reason}")
@@ -180,6 +178,9 @@ impl Catalog {
             Error::PythonEnvironmentSelectionMissing { path } => format!(
                 "错误：{} 中没有项目级 Python 选择，无法管理虚拟环境",
                 path.display()
+            ),
+            Error::PythonEnvironmentUnsupported { version } => format!(
+                "错误：Python {version} 尚未提供标准库 venv 模块；Pinset 会直接路由受管解释器，但不能为它创建项目虚拟环境"
             ),
             Error::NodeVersionNotInstalled { version } => {
                 format!("错误：Pinset 未安装 Node.js {version}")
@@ -288,10 +289,10 @@ impl Catalog {
     pub fn top_level_help(self) -> &'static str {
         match self.language {
             Language::English => {
-                "Pinset manages predictable runtime versions.\n\nUsage: pinset [--lang <en|zh-CN>] <COMMAND>\n\nCommands:\n  init         Create project configuration\n  detect       Detect traditional version files\n  import       Import traditional version selections\n  global       Show or batch-set global defaults\n  use          Select and lock project runtimes\n  unset        Clear a project or global selection\n  install      Install or repair a runtime\n  paths        Explain Pinset and runtime paths\n  uninstall    Safely uninstall an exact version\n  prune        Remove unused managed versions\n  outdated     Check selected versions for updates\n  current      Show the effective selection\n  list         List installed or available versions\n  lock         Audit lock integrity and ownership\n  cache        Inspect, verify or clean the download cache\n  which        Show the resolved command path\n  exec         Run with the selected version\n  doctor       Diagnose configuration and PATH\n  venv         Manage the project Python environment\n  shim         Repair or migrate command shims\n  env          Manage encrypted project environments\n  trust        Manage local project trust\n  self         Check or update Pinset\n  activate     Enable provider command routing in a shell\n  completions  Generate shell completion\n  source       Manage download sources\n  provider     Inspect and verify Provider manifests\n\nRun `pinset <command> --help` for command details."
+                "Pinset manages predictable runtime versions.\n\nUsage: pinset [--lang <en|zh-CN>] [-C <DIR>] <COMMAND>\n       pinset [-C <DIR>] [-e <PROFILE> | --no-env] -- <COMMAND> [ARGS...]\n\nCommands:\n  init         Create project configuration\n  setup        Preview or prepare a project environment\n  detect       Detect traditional version files\n  import       Import traditional version selections\n  global       Show or batch-set global defaults\n  use          Select and lock project runtimes\n  unset        Clear a project or global selection\n  install      Install or repair a runtime\n  paths        Explain Pinset and runtime paths\n  uninstall    Safely uninstall an exact version\n  prune        Remove unused managed versions\n  outdated     Check selected versions for updates\n  current      Show the effective selection\n  list         List installed or available versions\n  lock         Audit lock integrity and ownership\n  cache        Inspect, verify, prefetch or clean archives\n  bundle       Export or import offline artifacts\n  which        Show the resolved command path\n  exec         Run with the selected version\n  doctor       Diagnose configuration and PATH\n  status       Create a redacted diagnostic report\n  check        Fail when diagnostic action is required\n  venv         Manage the project Python environment\n  shim         Repair or migrate command shims\n  env          Manage encrypted project environments\n  trust        Manage local project trust\n  self         Check or update Pinset\n  activate     Enable provider command routing in a shell\n  completions  Generate shell completion\n  source       Manage download sources\n  provider     Inspect and verify Provider manifests\n\nRun `pinset <command> --help` for command details."
             }
             Language::SimplifiedChinese => {
-                "Pinset 用于统一管理可复现的运行时版本。\n\n用法：pinset [--lang <en|zh-CN>] <命令>\n\n执行 `pinset <命令> --help` 查看命令详情。"
+                "Pinset 用于统一管理可复现的运行时版本。\n\n用法：pinset [--lang <en|zh-CN>] [-C <目录>] <命令>\n      pinset [-C <目录>] [-e <环境> | --no-env] -- <程序> [参数...]\n\n执行 `pinset <命令> --help` 查看命令详情。"
             }
         }
     }
@@ -330,7 +331,7 @@ impl Catalog {
                 "显示当前版本、来源和安装路径。\n\n用法：pinset current [node|pnpm|bun|go|python|flutter|java|rust|dotnet] [--cwd <目录>] [--json]"
             }
             Some("list") => {
-                "列出本机已安装或官方可用的运行时版本；不传 Provider 时列出全部受管版本。\n\n用法：pinset list [node|pnpm|bun|go|python|flutter|java|rust|dotnet] [--available] [--json]"
+                "列出本机已安装或远端官方可用的运行时版本；不传 Provider 时列出全部受管版本。\n\n用法：pinset list [node|pnpm|bun|go|python|flutter|java|rust|dotnet] [--remote|--available] [--json]"
             }
             Some("outdated") => {
                 "检查当前项目与全局选择是否落后于最新稳定版本。\n\n用法：pinset outdated [工具] [--global|--cwd <目录>] [--json]"
@@ -345,13 +346,25 @@ impl Catalog {
                 "只读、离线审计配置、锁定平台制品、缓存、安装收据和所有权。\n\n用法：pinset lock audit [--global | --cwd <目录>] [--json]"
             }
             Some("cache") => {
-                "统计、验证、修复、清理或离线导入运行时下载缓存。\n\n用法：pinset cache <list|info|verify|repair|clean|import> [参数...]"
+                "统计、验证、预取、修复、清理或离线导入运行时下载缓存。\n\n用法：pinset cache <list|info|verify|repair|clean|import|prefetch> [参数...]"
+            }
+            Some("bundle") => {
+                "导出或导入经过完整性验证的离线运行时包。\n\n用法：pinset bundle <export|import> [参数...]"
             }
             Some("exec") => {
                 "使用当前选择或一次性运行时版本执行命令。\n\n用法：pinset exec [--cwd <目录>] [<工具>@<版本选择器>] -- <命令> [参数...]"
             }
             Some("doctor") => {
                 "只读检查配置、锁文件、运行时、shim 和 PATH。\n\n用法：pinset doctor [--cwd <目录>] [--json]"
+            }
+            Some("setup") => {
+                "准备当前项目的开发环境，沿用已有锁定版本。\n\n用法：pinset [-e <环境> | --no-env] setup [--plan | --yes | --resume <运行编号>] [--offline] [--task <已声明任务>] [--json]\n\n--plan 只读预览，不下载、不解密、不执行任务。非交互执行需要 --yes；恢复时校验原项目输入。"
+            }
+            Some("status") => {
+                "生成不含路径及秘密值的诊断报告，可保存或与基线比较。\n\n用法：pinset status [--cwd <目录>] [--json] [--save <文件>] [--compare <文件>] [--repair-preview]"
+            }
+            Some("check") => {
+                "检查诊断状态；存在错误、警告或基线差异时返回非零。\n\n用法：pinset check [--cwd <目录>] [--json] [--save <文件>] [--compare <文件>] [--repair-preview]"
             }
             Some("venv") => {
                 "管理 Pinset 创建并校验归属的项目 Python .venv，无需手动激活。\n\n用法：pinset venv <create|status|recreate> [--cwd <目录>]"
@@ -360,7 +373,7 @@ impl Catalog {
                 "查看、修复或迁移 Pinset Provider 命令路由。\n\n用法：\n  pinset shim path\n  pinset shim install [--provider <工具>] [--binary <文件>] [--dir <目录>] [命令...]\n  pinset shim migrate [--provider <工具>] [--dir <目录>]"
             }
             Some("env") => {
-                "管理按 profile 隔离的 age 加密项目环境变量。\n\n用法：pinset env <init|set|unset|list|reveal|import|export|recipient|identity> [参数...]"
+                "管理按 profile 隔离的 age 加密项目环境变量。无子命令时显示当前环境与选择来源。env init 交互初始化；env use dev 记住本机选择；env reset 清除选择；-e 临时覆盖环境。\n\n用法：pinset env <init|use|reset|set|unset|list|reveal|import|export|share|unshare|members|recipient|identity> [参数...]"
             }
             Some("trust") => {
                 "管理直接 shim 自动注入所需的本机项目信任。\n\n用法：pinset trust <add|status|revoke> [参数...]"
@@ -381,7 +394,7 @@ impl Catalog {
                 "只读查看并验证受约束的声明式 Provider Registry；验证不会安装、激活或执行第三方代码。\n\n用法：\n  pinset provider list [--json]\n  pinset provider verify [Registry 文件] [--json]"
             }
             _ => {
-                "Pinset 用于统一管理可复现的运行时版本。\n\n用法：pinset [--lang <en|zh-CN>] <命令>\n\n命令：\n  init         创建项目配置\n  detect       检测传统版本配置\n  import       导入传统版本选择\n  global       查看或设置全局默认版本\n  use          选择并锁定项目版本\n  unset        清除项目或全局选择\n  install      安装锁定或指定版本\n  uninstall    安全卸载精确版本\n  prune        清理未引用的受管版本\n  outdated     检查已选版本更新\n  current      显示当前生效选择\n  list         列出已安装或可用版本\n  lock         审计锁完整性与所有权\n  cache        统计、验证或清理下载缓存\n  which        显示实际命令路径\n  exec         使用当前选择执行命令\n  doctor       诊断配置与 PATH\n  venv         管理项目 Python 虚拟环境\n  shim         管理和迁移命令 shim\n  activate     为当前 Shell 启用命令路由\n  completions  生成 Shell 命令补全\n  source       管理下载源\n  provider     查看和验证 Provider 清单\n\n执行 `pinset --lang zh-CN <命令> --help` 查看详情。"
+                "Pinset 用于统一管理可复现的运行时版本。\n\n用法：pinset [--lang <en|zh-CN>] [-C <目录>] <命令>\n      pinset [-C <目录>] [-e <环境> | --no-env] -- <程序> [参数...]\n\n命令：\n  init         创建项目配置\n  setup        预览或准备项目开发环境\n  detect       检测传统版本配置\n  import       导入传统版本选择\n  global       查看或设置全局默认版本\n  use          选择并锁定项目版本\n  unset        清除项目或全局选择\n  install      安装锁定或指定版本\n  uninstall    安全卸载精确版本\n  prune        清理未引用的受管版本\n  outdated     检查已选版本更新\n  current      显示当前生效选择\n  list         列出已安装或可用版本\n  lock         审计锁完整性与所有权\n  cache        验证、预取或清理下载缓存\n  bundle       导出或导入离线制品\n  which        显示实际命令路径\n  exec         使用当前选择执行命令\n  doctor       诊断配置与 PATH\n  status       生成脱敏诊断报告\n  check        检查诊断状态\n  venv         管理项目 Python 虚拟环境\n  shim         管理和迁移命令 shim\n  activate     为当前 Shell 启用命令路由\n  completions  生成 Shell 命令补全\n  source       管理下载源\n  provider     查看和验证 Provider 清单\n\n执行 `pinset --lang zh-CN <命令> --help` 查看详情。"
             }
         }
     }

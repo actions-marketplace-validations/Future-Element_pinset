@@ -24,6 +24,7 @@ pub fn install_locked_npm_tool(
         .artifact(target)
         .ok_or_else(|| Error::LockedArtifactMissing {
             tool: locked_tool.name.clone(),
+            version: locked_tool.version.clone(),
             target: target.to_owned(),
         })?;
     let target_manifest = tool_targets(&locked_tool.name)?
@@ -31,12 +32,18 @@ pub fn install_locked_npm_tool(
         .find(|candidate| candidate.target == target)
         .ok_or_else(|| Error::LockedArtifactMissing {
             tool: locked_tool.name.clone(),
+            version: locked_tool.version.clone(),
             target: target.to_owned(),
         })?;
     let format = match artifact.format {
         LockedArtifactFormat::TarGz => ArtifactFormat::TarGz,
         LockedArtifactFormat::Zip => ArtifactFormat::Zip,
         LockedArtifactFormat::TarXz => ArtifactFormat::TarXz,
+        LockedArtifactFormat::Binary => {
+            return Err(Error::InvalidLockfile {
+                reason: format!("{} artifact cannot use binary format", locked_tool.name),
+            });
+        }
     };
     let use_overlays = if locked_tool.name == "pnpm" {
         let version = Version::parse(&locked_tool.version).map_err(|_| Error::InvalidLockfile {
@@ -94,6 +101,11 @@ fn overlay_install_spec(overlay: &LockedArtifactOverlay) -> Result<ArtifactInsta
         LockedArtifactFormat::TarGz => ArtifactFormat::TarGz,
         LockedArtifactFormat::Zip => ArtifactFormat::Zip,
         LockedArtifactFormat::TarXz => ArtifactFormat::TarXz,
+        LockedArtifactFormat::Binary => {
+            return Err(Error::InvalidLockfile {
+                reason: "npm overlay cannot use binary format".to_owned(),
+            });
+        }
     };
     Ok(ArtifactInstallSpec {
         artifact: ArtifactSpec {

@@ -1,5 +1,120 @@
 # Changelog
 
+## 2.14.0 - Unreleased
+
+- Check declared Node/bundled npm, Python, Go, Rust, Java/Gradle/AGP and .NET compatibility with explicit pass, fail, unknown and not-applicable results, revisioned rules and primary references.
+- Add optional schema 6 platform/build requirements, explicit migration previews and byte-for-byte config/lock backups. Existing schema 5 projects retain their schema until migration.
+- Add portable semantic environment comparison, separate trust/identity/variable checks, explicit source diagnostics and process-scoped enterprise CA support with TLS verification retained.
+- Verify every required platform SDK archive and overlay for offline delivery; reject incomplete or altered bundles before importing cache entries. Exact installed ephemeral runtime execution no longer requires metadata access.
+- Add optional Action preparation and portable summaries. Keep published defaults on 2.12.3 until the final combined release.
+- Update the website's Next.js and Sharp dependencies to patched versions.
+- Accept official Rust default-profile package aliases and the platform-specific `rust-mingw` component when validating generated locks.
+- Install official .NET tarballs containing a `./` root entry while retaining archive traversal and collision checks.
+
+## 2.13.0 - Unreleased
+
+- Add explicit project preparation plans and restartable setup with locked runtime reuse, managed Python environments, contract checks and opt-in declared tasks.
+- Add opt-in environment report v2 and execution evidence; retain diagnostic and editor protocol v1 compatibility.
+- Keep public installer and Action defaults on the published release until the combined environment release is verified.
+
+## 2.12.3 - 2026-09-11
+
+- Correct Windows audit of official CPython MSI installations and do not require a standard-library `venv` from Python 2 releases that do not provide it.
+- Add extensionless POSIX command wrappers alongside Windows `.cmd` shims so Git Bash, MSYS, and `#!/bin/sh` Git hooks can resolve project-selected runtimes such as `node` without requiring a separate system installation. Existing Pinset `.cmd` routes are upgraded in place without overwriting foreign command entries.
+- Upgrade the VS Code extension to 1.1.1 with a Marketplace icon, status-bar CLI installation and project initialization actions, toolchain/environment summaries, and source-aware diagnostics that no longer attach operational findings to line 1 of `pinset.toml`.
+
+## 2.12.2 - 2026-09-11
+
+- Remove GitHub REST API usage from self-update version discovery. Stable checks resolve GitHub's public `releases/latest` redirect, while prerelease checks read the repository's Atom release feed; exact-version updates continue to download release assets directly.
+
+## 2.12.1 - 2026-09-09
+
+- Prefer native artifacts from each runtime project's official release archive. Python now installs supported python.org full ZIPs, component MSI bundles, and historical monolithic MSIs directly, falling back to a compatible distribution only when the official archive has no native artifact for the current target.
+- Keep custom source registration separate from selection. A selected HTTPS source granted `--trust-metadata` is tried first, the official source is added automatically as the next metadata and artifact source, and other merely registered sources are never contacted.
+- Retain `source fallback` as an explicit artifact-only retry list after the selected and official sources. Trusted metadata fallback does not implicitly enumerate every registered source.
+- Refresh the bilingual website and brand assets, and resolve the displayed current version from the latest GitHub Release instead of hardcoding it into the site UI.
+
+Project configuration and runtime lock schemas are unchanged. Pinset continues to download, verify, extract, and install runtime artifacts itself without invoking another runtime version manager.
+
+## 2.12.0 - 2026-09-09
+
+- Expose stable historical releases from each Provider's official metadata without requiring every Pinset target to have an artifact. `pinset list <tool> --remote` is now the primary remote-index spelling, while `--available` remains a compatible alias.
+- Upgrade runtime locks to schema 5 so each exact release records only the verified artifacts that upstream actually published. Schema 1-4 locks remain readable, and their historical complete-matrix validation and migration behavior are preserved.
+- Fail before changing project or global selection state when the chosen release has no artifact for the current machine. Errors now distinguish a missing target artifact from a version that is absent upstream.
+- Extend historical metadata compatibility across Node.js, Go, Flutter, Python, Eclipse Temurin, Rust, .NET, pnpm, Bun, and declarative GitHub-release Providers, including older manifest, package-name, tag, and support-phase shapes.
+- Merge the published CPython archive into Python remote listings and identify releases that have no installable `python-build-standalone` distribution. Retain .NET end-of-life SDKs for explicit selection with a warning while keeping floating `latest`, `current`, and `lts` selectors on supported channels.
+
+Project configuration remains schema 5. Runtime locks migrate to schema 5 when a selection is written; the lock contains only upstream-published target artifacts and never substitutes repackaged binaries for a missing official distribution.
+
+## 2.11.1 - 2026-09-08
+
+- Restore the schema 3 selector contract for every built-in runtime Provider. Historical locks may keep selectors such as `lts`, `latest`, a major version, or a channel in `requested` while recording the exact resolved release in `version`.
+- Allow project/global migration and self-update compatibility repair to read those valid schema 3 locks, while continuing to reject selector mismatches in schema 1/2, configuration/lock disagreements, unknown Providers, malformed artifacts, and unsupported target gaps.
+- Add regression coverage for Node.js, pnpm, Bun, Go, Flutter, Python, Java, Rust, and .NET SDK selectors, every pre-1.0 Linux ARM64 target refresh, and the reported `pinset migrate --global` path.
+
+No configuration or lock schema changes are introduced. Explicit migration still upgrades schema 3 locks to schema 4 atomically and preserves both the requested selector and exact resolved version.
+
+## 2.11.0 - 2026-09-08
+
+- Add portable `status` and strict `check` diagnostics, redacted report schema 1, saved-report comparison, repair previews, and verified GitHub Action cache restores.
+- Add concurrent `cache prefetch`, verified offline bundle export/import, and an explicit offline locked-install mode that reports all missing artifacts before changing installation state.
+- Add schema 5 `[tool-options]`, lock schema 4 option identities, and installation receipt schema 4 so one exact release can coexist with different verified tool configurations.
+- Add Rust profiles, extra components, extra compilation targets, and fixed-date nightly toolchains. Rust artifacts and target overlays remain bound to the official v2 manifest and SHA-256 identities.
+- Add Eclipse Temurin JDK/JRE selection with package-aware metadata, lock, install identities, archive validation, and runtime command checks.
+- Add isolated named Python environments, ownership marker schema 2, `venv <command> [name]`, and task-level `python-environment` binding while preserving the default `.venv` contract.
+- Add schema 5 explicit workspaces with root defaults, whole-option member overrides, independent member locks, batch install/check/task/update-preview commands, changed-member filtering, and tool-reference reports.
+- Add exact candidate lock preparation, isolated candidate task execution, baseline-bound test records, conflict-safe apply/history/restore, and recoverable multi-member workspace transactions.
+- Promote the signed Provider Registry to schema 2 with revision and disable controls, explicit local trust, structural validation, contributor scaffolding, and a constrained GitHub release binary backend that cannot run scripts or hooks.
+- Add `jq` as the first declarative Provider, covering selector resolution, upstream SHA-256 verification, atomic single-binary installation, CLI/shim routing, update, offline cache, audit, and semantic-version uninstall across revision-bound installation identities.
+- Add task dependency graphs with deterministic execute-once ordering, cycle validation, selected-task argument appending, and first-failure stopping for normal, workspace, and candidate task runs.
+- Add versioned `pinset editor context` output and a VS Code 1.0.0 extension with trusted-workspace gating, per-folder multi-root status, diagnostics, environment selection, task entries, and process-tree cancellation.
+
+Project configuration remains schema 5. Runtime locks migrate explicitly to schema 4; schema 1-3 locks remain readable. Installations without structured options retain their historical version-only directory identity, and receipt schemas 1-3 remain readable.
+
+## 2.3.0 - 2026-09-07
+
+- Add schema 5 project tasks with argument-array commands, optional project-relative working directories, environment profiles, descriptions, and appended arguments through `pinset run <task> -- <arguments...>`.
+- Add typed environment-variable contracts for strings, integers, booleans, URLs, and enums, with required fields, profile filters, non-secret defaults, and secret-default rejection. Validate contracts before command injection.
+- Add `pinset env check` and `pinset env diff` reports that expose readiness and variable structure without printing secret values or secret-derived hashes.
+- Preserve schema 4 projects until explicit migration, retain TOML comments during schema-only migration, and keep migration writes atomic under the existing project-state lock.
+
+Project configuration migrates to schema 5; the runtime lock remains schema 3. Schema 1-4 projects remain readable, and existing schema 4 encrypted environments continue to work before migration.
+
+## 2.2.0 - 2026-09-07
+
+- Add `pinset [-C <directory>] [-e <profile> | --no-env] -- <command> [arguments...]` for managed tools, project Python commands, and explicit external programs. Preserve the existing `exec` and `x` contracts.
+- Share runtime PATH, runtime variables, and profile selection between CLI execution and shims. Remember machine-local project profiles with `env use`; clear them with `env reset` or `env use --reset`. Bind preferences to canonical project paths and project IDs, and ignore local preferences in CI.
+- Add an interactive `env init` workflow, stored identity reuse, current environment display, and `env share`, `env unshare`, and `env members` shortcuts.
+- Update bilingual help, command references, completions, and native CI coverage. Accept any positive `rc.N` release candidate whose base matches the workspace version.
+
+No project configuration or lock schema change is required. Tasks and variable contracts remain planned for 2.3.
+
+## 2.1.6 - 2026-08-31
+
+- Check and migrate a safely recognized incompatible global lock before `pinset self update` downloads a release.
+- Classify the historical Node.js HTTPS checksum as checksum-strength so its OpenPGP upgrade passes anti-downgrade validation.
+- Document `pinset migrate --global` as the explicit repair command and keep unknown or corrupted lock shapes fail-closed.
+
+No configuration or lock schema migration is required. The compatibility migration re-resolves selected pre-1.0 Node.js, pnpm, Bun, Go, Python, Java, Rust, and .NET SDK records at their existing exact versions. Flutter is unchanged.
+
+## 2.1.5 - 2026-08-31
+
+- Repair every exact pre-1.0 Provider target matrix expanded for Linux ARM64: Node.js, pnpm, Bun, Go, Python, Java, Rust, and .NET SDK.
+- Re-resolve each affected Provider at its existing exact version, preserve its requested selector, and upgrade legacy Node.js locks to the current OpenPGP-authenticated metadata contract.
+- Apply the shared compatibility migration to project/global selection, update, migrate, unset, and project-import state changes while keeping install, execution, and other ordinary lock reads strict.
+- Reject unknown or corrupted target gaps, validate all existing artifacts before migration, and leave configuration and lock bytes unchanged when any Provider refresh fails.
+
+No configuration or lock schema migration is required. Flutter is unchanged because its supported target matrix did not add Linux ARM64. Existing unselected installations and their receipts are preserved; only selected lock records are rebuilt during an explicit state-changing command or `pinset migrate`.
+
+## 2.1.4 - 2026-08-31
+
+- Repair pre-1.0 pnpm and Bun locks that predate Linux ARM64 target coverage when a project or global selection is next changed.
+- Preserve existing selectors and exact resolved versions while rebuilding only the missing npm Provider target records from verified official metadata.
+- Keep ordinary lock reads strict, reject corrupted existing artifacts during repair, and preserve the previous lock bytes exactly if a paired configuration write must roll back.
+- Refresh the yanked `chacha20` transitive dependency to its maintained compatible release.
+
+No configuration or lock schema migration is required. The compatibility repair is limited to the historical missing `linux-aarch64` pnpm/Bun artifact and runs only during an explicit `pinset use` or `pinset global` state change.
+
 ## 2.1.3 - 2026-08-27
 
 - Strengthen the documentation site's Google site-name signals by keeping the Pinset brand identity and canonical subdomain consistent across exported pages.

@@ -6,9 +6,13 @@ inputs:
   version:
     description: Exact Pinset release version without the leading v.
     required: false
-    default: 2.1.3
+    default: 2.12.3
   install:
     description: Run pinset install --locked after Pinset is available.
+    required: false
+    default: "true"
+  cache:
+    description: Cache verified runtime archives and revalidate them after every restore.
     required: false
     default: "true"
   working-directory:
@@ -16,9 +20,22 @@ inputs:
     required: false
     default: .
   trust-project-id:
-    description: Expected non-secret schema 4 project-id to trust for encrypted environment injection.
+    description: Expected non-secret project-id to trust for encrypted environment injection.
     required: false
     default: ""
+  prepare:
+    description: Run pinset setup --yes to prepare the declared environment (Pinset 2.13 or newer).
+    required: false
+    default: "false"
+  environment-report:
+    description: Save a portable environment report and add a summary (Pinset 2.13 or newer).
+    required: false
+    default: "false"
+
+outputs:
+  environment-report:
+    description: Path to the portable environment report, when requested.
+    value: ${{ steps.environment-report.outputs.path }}
 
 runs:
   using: composite
@@ -81,8 +98,27 @@ runs:
         Expand-Archive -LiteralPath (Join-Path $root $archive) -DestinationPath $bin -Force
         Add-Content -LiteralPath $env:GITHUB_PATH -Value $bin
 
+    - name: Configure isolated Pinset data directory
+      shell: bash
+      run: |
+        printf 'PINSET_HOME=%s\n' "${RUNNER_TEMP}/pinset-action-home" >> "${GITHUB_ENV}"
+
+    - name: Restore verified runtime archives
+      if: inputs.cache == 'true'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/pinset-action-home/downloads
+        key: pinset-artifacts-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/pinset.lock', inputs.working-directory)) }}
+        restore-keys: |
+          pinset-artifacts-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Revalidate restored runtime archives
+      if: inputs.cache == 'true'
+      shell: bash
+      run: pinset cache verify
+
     - name: Install locked runtimes
-      if: inputs.install == 'true'
+      if: inputs.install == 'true' && inputs.prepare != 'true'
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       run: pinset install --locked
@@ -91,7 +127,27 @@ runs:
       if: inputs.trust-project-id != ''
       shell: bash
       working-directory: ${{ inputs.working-directory }}
-      run: pinset trust add --project-id "${{ inputs.trust-project-id }}"
+      env:
+        PINSET_EXPECTED_PROJECT_ID: ${{ inputs.trust-project-id }}
+      run: pinset trust add --project-id "${PINSET_EXPECTED_PROJECT_ID}"
+
+    - name: Prepare the declared development environment
+      if: inputs.prepare == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: pinset setup --yes
+
+    - name: Save portable environment report
+      id: environment-report
+      if: always() && inputs.environment-report == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        report="${RUNNER_TEMP}/pinset-environment-report.json"
+        pinset status --report-version 2 --save "${report}" --json > "${RUNNER_TEMP}/pinset-environment-envelope.json"
+        printf 'path=%s\n' "${report}" >> "${GITHUB_OUTPUT}"
+        python "${GITHUB_ACTION_PATH}/scripts/environment_summary.py" "${report}"
 
 branding:
   icon: check-circle

@@ -1,4 +1,34 @@
+mod build_conditions;
 mod config;
+pub use build_conditions::check_build_conditions;
+#[cfg(feature = "http-client")]
+mod http_client;
+#[cfg(feature = "http-client")]
+pub use http_client::{client_builder_with_ca, http_client_builder};
+#[cfg(all(feature = "project-discovery", feature = "lockfile"))]
+mod compatibility;
+#[cfg(all(feature = "project-discovery", feature = "lockfile"))]
+mod compatibility_ranges;
+#[cfg(all(feature = "installer", feature = "lockfile"))]
+mod environment_delivery;
+#[cfg(feature = "installer")]
+mod network_diagnostics;
+#[cfg(all(feature = "project-discovery", feature = "lockfile"))]
+pub use compatibility::{check_bundled_npm, check_compatibility};
+#[cfg(all(feature = "installer", feature = "lockfile"))]
+pub use environment_delivery::{
+    DeliveryArtifact, DeliveryReport, artifacts_for_platform, inspect_offline_delivery,
+};
+#[cfg(feature = "installer")]
+pub use network_diagnostics::*;
+#[cfg(feature = "declarative-provider")]
+mod declarative_provider;
+#[cfg(all(
+    feature = "installer",
+    feature = "declarative-provider",
+    feature = "lockfile"
+))]
+mod declarative_runtime;
 #[cfg(feature = "dotnet-metadata")]
 mod dotnet_metadata;
 #[cfg(feature = "dotnet-provider")]
@@ -12,6 +42,9 @@ mod dotnet_runtime;
 #[cfg(feature = "installer")]
 mod download_cache;
 mod environment_protocol;
+mod environment_report;
+#[cfg(feature = "environment-selection")]
+mod environment_selection;
 mod error;
 #[cfg(feature = "flutter-metadata")]
 mod flutter_metadata;
@@ -90,19 +123,34 @@ mod source_config;
 #[cfg(any(feature = "project-write", feature = "state-write"))]
 mod state_write_lock;
 mod target;
+#[cfg(feature = "project-write")]
+pub use state_write_lock::acquire_setup_state_write_lock;
 mod user_settings;
 
 #[cfg(feature = "lockfile")]
 pub use config::validate_project_lock_policy;
 pub use config::{
-    EnvironmentCollision, EnvironmentProfile, PROJECT_CONFIG_FILENAME, PROJECT_CONFIG_SCHEMA,
-    ProjectBoundary, ProjectConfig, ProjectContext, ProjectEnvironment, ProjectPolicy,
-    find_optional_project_config, find_project_config, find_project_context, load_project_config,
+    ENVIRONMENT_BUILD_TARGETS, ENVIRONMENT_PLATFORMS, EnvironmentCollision, EnvironmentProfile,
+    EnvironmentVariableContract, EnvironmentVariableType, PROJECT_CONFIG_FILENAME,
+    PROJECT_CONFIG_SCHEMA, ProjectBoundary, ProjectConfig, ProjectContext, ProjectEnvironment,
+    ProjectPolicy, ProjectPython, ProjectPythonEnvironmentConfig, ProjectRequirements, ProjectTask,
+    ProjectWorkspace, ToolOptions, WorkspaceMember, effective_project_config,
+    find_optional_project_config, find_project_config, find_project_context, find_workspace_config,
+    load_effective_project_config, load_project_config, project_task_order,
+    validate_environment_variable_value, workspace_members,
 };
 #[cfg(feature = "project-write")]
 pub use config::{create_project_config, save_project_config};
 #[cfg(all(feature = "project-write", feature = "lockfile"))]
 pub use config::{save_project_state, save_project_state_locked};
+#[cfg(feature = "declarative-provider")]
+pub use declarative_provider::DeclarativeProviderClient;
+#[cfg(all(
+    feature = "installer",
+    feature = "declarative-provider",
+    feature = "lockfile"
+))]
+pub use declarative_runtime::install_locked_declarative_provider;
 #[cfg(feature = "dotnet-metadata")]
 pub use dotnet_metadata::{DotnetMetadataClient, DotnetRelease};
 #[cfg(feature = "dotnet-provider")]
@@ -124,6 +172,14 @@ pub use download_cache::{
     repair_download_cache, verify_download_cache,
 };
 pub use environment_protocol::{decode_environment, encode_environment};
+pub use environment_report::{
+    EnvironmentCheck, EnvironmentDescriptor, ExecutionEvidence, ReadinessState, RuntimeDescriptor,
+    VariableRequirement,
+};
+#[cfg(feature = "project-write")]
+pub use environment_selection::save_local_environment;
+#[cfg(feature = "environment-selection")]
+pub use environment_selection::{EnvironmentSelection, environment_selection, select_environment};
 pub use error::{Error, Result};
 #[cfg(feature = "flutter-metadata")]
 pub use flutter_metadata::{FlutterMetadataClient, FlutterRelease};
@@ -159,7 +215,7 @@ pub use go_runtime::install_locked_go;
 pub use installer::{
     ArtifactFormat, ArtifactInstallSpec, ArtifactSource, ArtifactSourceKind, ArtifactSpec,
     DownloadProgressEvent, InstallAlias, InstallLimits, InstallOutcome, InstallRequest, Installer,
-    install_payload_statistics, sha256_hex,
+    PrefetchOutcome, install_payload_statistics, sha256_hex,
 };
 #[cfg(any(feature = "installer", feature = "lockfile", feature = "npm-metadata"))]
 pub use integrity::{ArtifactIntegrity, IntegrityAlgorithm};
@@ -168,21 +224,23 @@ pub use java_metadata::{JavaMetadataClient, JavaRelease};
 #[cfg(feature = "java-provider")]
 pub use java_provider::{
     JAVA_TARGETS, JavaArchiveFormat, JavaArtifactPlan, JavaVersion, plan_java_artifact,
-    validate_exact_java_version,
+    plan_java_artifact_with_package, validate_exact_java_version,
 };
 #[cfg(all(feature = "installer", feature = "java-provider", feature = "lockfile"))]
 pub use java_runtime::install_locked_java;
 #[cfg(all(feature = "installer", feature = "lockfile"))]
 pub use lock_audit::{
     LockAuditCategory, LockAuditFinding, LockAuditReasonCode, LockAuditRepair, LockAuditReport,
-    LockAuditScope, LockAuditSeverity, LockAuditSummary, audit_global_lock, audit_project_lock,
+    LockAuditScope, LockAuditSeverity, LockAuditSummary, audit_global_lock,
+    audit_project_environment, audit_project_lock,
 };
 #[cfg(feature = "lockfile")]
 pub use lockfile::{
     LOCKFILE_FILENAME, LOCKFILE_SCHEMA, LockedArtifact, LockedArtifactFormat,
     LockedArtifactOverlay, LockedTool, Lockfile, MVP_NODE_TARGETS, load_lockfile,
-    load_optional_lockfile, lockfile_path, save_lockfile, validate_lock_matches_project,
-    validate_lock_matches_selection, validate_lock_matches_tool, validate_lock_matches_tools,
+    load_lockfile_for_provider_refresh, load_lockfile_for_target_refresh, load_optional_lockfile,
+    lockfile_path, save_lockfile, validate_lock_matches_project, validate_lock_matches_selection,
+    validate_lock_matches_tool, validate_lock_matches_tool_options, validate_lock_matches_tools,
 };
 #[cfg(feature = "node-provider")]
 pub use node_lifecycle::{
@@ -218,16 +276,23 @@ pub use provenance::{
 };
 #[cfg(feature = "provider-registry")]
 pub use provider_registry::{
-    DeclarativeProvenanceCapabilities, DeclarativeProviderCapabilities,
-    DeclarativeProviderManifest, ProviderRegistryDocument, VerifiedProviderRegistry,
-    embedded_provider_registry, load_signed_provider_registry, verify_signed_provider_registry,
+    DeclarativeProvenanceCapabilities, DeclarativeProviderBackend, DeclarativeProviderCapabilities,
+    DeclarativeProviderManifest, PROVIDER_REGISTRY_FILENAME, ProviderRegistryDocument,
+    VerifiedProviderRegistry, effective_provider_registry, embedded_provider_registry,
+    load_signed_provider_registry, provider_registry_path, validate_provider_registry_json,
+    validate_runtime_provider_declarations, verify_signed_provider_registry,
+};
+#[cfg(all(feature = "provider-registry", feature = "lockfile"))]
+pub use provider_registry::{
+    validate_locked_declarative_provider, validate_locked_provider_manifest,
 };
 #[cfg(feature = "python-metadata")]
 pub use python_metadata::{PythonMetadataClient, PythonRelease};
 #[cfg(feature = "python-provider")]
 pub use python_provider::{
     PYTHON_TARGETS, PYTHON_VARIANT, PythonArtifactPlan, is_exact_python_version,
-    parse_python_distribution, plan_python_artifact, validate_exact_python_version,
+    parse_python_distribution, plan_python_artifact, python_supports_stdlib_venv,
+    validate_exact_python_version,
 };
 #[cfg(all(
     feature = "installer",
@@ -237,17 +302,21 @@ pub use python_provider::{
 pub use python_runtime::install_locked_python;
 pub use python_venv::{
     PYTHON_ENVIRONMENT_DIR, PYTHON_ENVIRONMENT_MARKER, ProjectPythonEnvironment,
-    create_project_python_environment, load_project_python_environment,
+    create_project_python_environment, create_project_python_environment_for,
+    load_project_python_environment, load_project_python_environment_for,
     project_python_command_candidates, project_python_environment_path,
+    project_python_environment_path_for,
 };
 pub use resolver::{
-    CommandResolution, RuntimeEnvironmentVariable, SelectionSource, ToolSelection, command_tool,
-    find_system_commands, java_home_for_install, managed_runtime_arguments,
-    path_with_selected_runtime, path_with_selected_tools, pinset_home, pinset_home_from_env,
-    resolve_command, resolve_command_with_path, resolve_from_env, resolve_project_python_command,
-    resolve_tool_selection, runtime_command_candidates, runtime_command_directory,
-    runtime_environment_for_install, selected_runtime_environment,
-    validate_managed_runtime_invocation, validate_windows_batch_arguments,
+    CommandResolution, ExecutionContext, RuntimeEnvironmentVariable, SelectionSource,
+    ToolSelection, command_tool, execution_context, find_system_commands, java_home_for_install,
+    managed_runtime_arguments, path_with_selected_runtime, path_with_selected_tools, pinset_home,
+    pinset_home_from_env, resolve_command, resolve_command_with_path, resolve_execution_command,
+    resolve_execution_command_for_python_environment, resolve_from_env,
+    resolve_project_python_command, resolve_project_python_command_for, resolve_tool_selection,
+    runtime_command_candidates, runtime_command_directory, runtime_environment_for_install,
+    selected_runtime_environment, validate_managed_runtime_invocation,
+    validate_windows_batch_arguments,
 };
 pub use runtime_lifecycle::{
     InstalledToolVersion, ProtectedToolVersion, PruneToolCandidate, PruneToolPlan,
@@ -268,7 +337,8 @@ pub use rust_metadata::{RustMetadataClient, RustRelease};
 #[cfg(feature = "rust-provider")]
 pub use rust_provider::{
     RUST_COMPONENTS, RUST_PROFILE, RUST_TARGETS, RustArchiveFormat, RustArtifactPlan, RustVersion,
-    plan_rust_artifact, rust_target_triple, validate_exact_rust_version,
+    plan_rust_artifact, plan_rust_nightly_artifact, rust_target_triple,
+    validate_exact_rust_version,
 };
 #[cfg(all(feature = "installer", feature = "rust-provider", feature = "lockfile"))]
 pub use rust_runtime::install_locked_rust;

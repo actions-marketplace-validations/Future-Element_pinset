@@ -2,6 +2,9 @@ use std::{env::JoinPathsError, path::PathBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("local environment selection at {path}: {reason}")]
+    LocalEnvironment { path: PathBuf, reason: String },
+
     #[error("no pinset.toml was found from {start} or its ancestors")]
     ProjectConfigNotFound { start: PathBuf },
 
@@ -19,7 +22,9 @@ pub enum Error {
         source: toml::de::Error,
     },
 
-    #[error("unsupported pinset.toml schema {actual}; this version supports schemas 1, 2, 3 and 4")]
+    #[error(
+        "unsupported pinset.toml schema {actual}; this version supports schemas 1, 2, 3, 4 and 5"
+    )]
     UnsupportedSchema { actual: u32 },
 
     #[error("invalid pinset.toml configuration: {reason}")]
@@ -163,7 +168,9 @@ pub enum Error {
     },
 
     #[cfg(feature = "lockfile")]
-    #[error("unsupported pinset.lock schema {actual}; this version supports schemas 1, 2 and 3")]
+    #[error(
+        "unsupported pinset.lock schema {actual}; this version supports schemas 1, 2, 3, 4 and 5"
+    )]
     UnsupportedLockfileSchema { actual: u32 },
 
     #[cfg(feature = "lockfile")]
@@ -190,8 +197,14 @@ pub enum Error {
     LockedToolMissing { tool: String },
 
     #[cfg(feature = "lockfile")]
-    #[error("pinset.lock does not contain {tool} artifact for {target}")]
-    LockedArtifactMissing { tool: String, target: String },
+    #[error(
+        "{tool}@{version} exists, but its official distribution has no installable artifact for {target}"
+    )]
+    LockedArtifactMissing {
+        tool: String,
+        version: String,
+        target: String,
+    },
 
     #[cfg(feature = "lockfile")]
     #[error(
@@ -335,6 +348,30 @@ pub enum Error {
     #[error("Provider Registry is invalid: {reason}")]
     ProviderRegistryInvalid { reason: String },
 
+    #[cfg(feature = "declarative-provider")]
+    #[error("declarative Provider metadata contains no stable release matching \"{selector}\"")]
+    DeclarativeProviderVersionNotFound { selector: String },
+
+    #[cfg(feature = "declarative-provider")]
+    #[error("failed to request declarative Provider metadata {url}: {source}")]
+    DeclarativeProviderMetadataRequest {
+        url: String,
+        #[source]
+        source: reqwest::Error,
+    },
+
+    #[cfg(feature = "declarative-provider")]
+    #[error("failed to read declarative Provider metadata {url}: {source}")]
+    DeclarativeProviderMetadataRead {
+        url: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[cfg(feature = "declarative-provider")]
+    #[error("invalid declarative Provider metadata: {reason}")]
+    DeclarativeProviderMetadataInvalid { reason: String },
+
     #[cfg(feature = "sources")]
     #[error("invalid source alias \"{alias}\"; use lowercase letters, digits, '.', '_' or '-'")]
     InvalidSourceAlias { alias: String },
@@ -445,6 +482,12 @@ pub enum Error {
 
     #[cfg(feature = "go-metadata")]
     #[error(
+        "Go {version} exists in the official archive, but its index publishes no verifiable SHA-256 artifact for a Pinset target"
+    )]
+    GoArtifactsUnverifiable { version: String },
+
+    #[cfg(feature = "go-metadata")]
+    #[error(
         "invalid Go selector \"{selector}\"; expected x.y.z, a major/minor prefix, latest or current"
     )]
     InvalidGoSelector { selector: String },
@@ -488,12 +531,21 @@ pub enum Error {
     UnsupportedFlutterTarget { target: String },
 
     #[cfg(feature = "python-provider")]
-    #[error("invalid exact Python distribution \"{version}\"; expected x.y.z+YYYYMMDD")]
+    #[error("invalid exact Python distribution \"{version}\"; expected x.y.z or x.y.z+YYYYMMDD")]
     InvalidPythonVersion { version: String },
 
     #[cfg(feature = "python-provider")]
     #[error("unsupported Python target \"{target}\"")]
     UnsupportedPythonTarget { target: String },
+
+    #[cfg(feature = "python-metadata")]
+    #[error(
+        "Python {version} exists in the official CPython archive, but no supported artifact is available for {distribution}"
+    )]
+    PythonDistributionUnavailable {
+        version: String,
+        distribution: String,
+    },
 
     #[cfg(feature = "python-metadata")]
     #[error("invalid Python selector \"{selector}\"")]
@@ -682,6 +734,11 @@ pub enum Error {
 
     #[error("project Python environment requires a project-level Python selection in {path}")]
     PythonEnvironmentSelectionMissing { path: PathBuf },
+
+    #[error(
+        "Python {version} predates the standard-library venv module; Pinset routes the managed interpreter directly and cannot create a project venv"
+    )]
+    PythonEnvironmentUnsupported { version: String },
 
     #[error("failed to run the managed Python interpreter while creating {path}: {source}")]
     PythonEnvironmentCreate {
@@ -1013,6 +1070,10 @@ pub enum Error {
     },
 
     #[cfg(feature = "installer")]
+    #[error("offline mode requires cached artifact {integrity}")]
+    OfflineArtifactMissing { integrity: String },
+
+    #[cfg(feature = "installer")]
     #[error("required runtime path must be relative and contained: {path}")]
     InvalidRequiredPath { path: PathBuf },
 
@@ -1026,19 +1087,15 @@ pub enum Error {
     )]
     InvalidArtifactIntegrity { value: String },
 
-    #[cfg(any(
-        feature = "installer",
-        feature = "go-metadata",
-        feature = "node-metadata",
-        feature = "npm-metadata",
-        feature = "rust-metadata",
-        feature = "dotnet-metadata"
-    ))]
+    #[cfg(feature = "http-client")]
     #[error("failed to build the HTTP client: {source}")]
     HttpClient {
         #[source]
         source: reqwest::Error,
     },
+
+    #[error("invalid network configuration: {reason}")]
+    InvalidNetworkConfig { reason: String },
 
     #[cfg(feature = "installer")]
     #[error("failed to request artifact {url}: {source}")]
@@ -1167,6 +1224,27 @@ pub enum Error {
         path: PathBuf,
         #[source]
         source: std::io::Error,
+    },
+
+    #[cfg(feature = "installer")]
+    #[error("invalid artifact URL: {url}")]
+    InvalidArtifactUrl { url: String },
+
+    #[cfg(feature = "installer")]
+    #[error("failed to start {format} archive extraction for {path}: {source}")]
+    NativeArchiveExtract {
+        format: String,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[cfg(feature = "installer")]
+    #[error("{format} archive extraction failed for {path} with exit code {code}")]
+    NativeArchiveExtractFailed {
+        format: String,
+        path: PathBuf,
+        code: i32,
     },
 
     #[cfg(feature = "installer")]

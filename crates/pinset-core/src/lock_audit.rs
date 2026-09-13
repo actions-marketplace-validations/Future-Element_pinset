@@ -17,9 +17,9 @@ use crate::{
     ArtifactIntegrity, Error, GLOBAL_STATE_SCHEMA, LOCKFILE_SCHEMA, LockedArtifact, Lockfile,
     MinimumReleaseAge, PROJECT_CONFIG_FILENAME, PROJECT_CONFIG_SCHEMA, RuntimeLockAuditKind,
     VerificationStrength, current_target_for_tool, download_cache::verify_download_cache_integrity,
-    find_optional_project_config, global_config_path, global_lockfile_path, load_global_config,
-    load_lockfile, load_project_config, load_project_python_environment, lockfile_path,
-    runtime_provider,
+    find_optional_project_config, global_config_path, global_lockfile_path,
+    load_effective_project_config, load_global_config, load_lockfile,
+    load_project_python_environment, lockfile_path, python_supports_stdlib_venv, runtime_provider,
 };
 
 const MAX_AUDIT_RECEIPT_BYTES: u64 = 64 * 1024;
@@ -216,6 +216,8 @@ struct AuditInstallReceipt {
     #[serde(default)]
     version: String,
     #[serde(default)]
+    install_identity: Option<String>,
+    #[serde(default)]
     target: String,
     #[serde(default)]
     canonical_url: Option<String>,
@@ -250,13 +252,27 @@ struct AuditInstallReceipt {
 pub fn audit_project_lock(pinset_home: &Path, cwd: &Path) -> LockAuditReport {
     let config = project_config_path_for_audit(cwd);
     let lockfile = lockfile_path(&config);
-    audit_lock_paths(pinset_home, LockAuditScope::Project, config, lockfile)
+    audit_lock_paths(pinset_home, LockAuditScope::Project, config, lockfile, true)
+}
+
+/// Configuration, locked artifact and installation ownership checks for background UI.
+/// Archive contents are deliberately outside this scope; use audit_project_lock for a full audit.
+pub fn audit_project_environment(pinset_home: &Path, cwd: &Path) -> LockAuditReport {
+    let config = project_config_path_for_audit(cwd);
+    let lockfile = lockfile_path(&config);
+    audit_lock_paths(
+        pinset_home,
+        LockAuditScope::Project,
+        config,
+        lockfile,
+        false,
+    )
 }
 
 pub fn audit_global_lock(pinset_home: &Path) -> LockAuditReport {
     let config = global_config_path(pinset_home);
     let lockfile = global_lockfile_path(pinset_home);
-    audit_lock_paths(pinset_home, LockAuditScope::Global, config, lockfile)
+    audit_lock_paths(pinset_home, LockAuditScope::Global, config, lockfile, true)
 }
 
 fn audit_lock_paths(
@@ -264,6 +280,7 @@ fn audit_lock_paths(
     scope: LockAuditScope,
     config_path: PathBuf,
     lock_path: PathBuf,
+    include_cache: bool,
 ) -> LockAuditReport {
     let mut report = LockAuditReport {
         scope,
@@ -285,6 +302,7 @@ fn audit_lock_paths(
             config,
             lockfile,
             &mut report,
+            include_cache,
         );
     }
     report.finish();
@@ -297,12 +315,14 @@ fn load_config_selection(
     report: &mut LockAuditReport,
 ) -> Option<ConfigSelection> {
     let result = match scope {
-        LockAuditScope::Project => load_project_config(path).map(|config| ConfigSelection {
-            schema: config.schema,
-            tools: config.tools,
-            verification_strength: config.policy.verification_strength,
-            minimum_release_age: config.policy.minimum_release_age,
-        }),
+        LockAuditScope::Project => {
+            load_effective_project_config(path).map(|config| ConfigSelection {
+                schema: config.schema,
+                tools: config.tools,
+                verification_strength: config.policy.verification_strength,
+                minimum_release_age: config.policy.minimum_release_age,
+            })
+        }
         LockAuditScope::Global => load_global_config(path).map(|config| ConfigSelection {
             schema: config.schema,
             tools: config.tools,
@@ -316,7 +336,12 @@ fn load_config_selection(
                 LockAuditScope::Project => PROJECT_CONFIG_SCHEMA,
                 LockAuditScope::Global => GLOBAL_STATE_SCHEMA,
             };
-            if config.schema < expected_schema {
+            // Schema 6 adds optional requirements; schema 5 retains its full behavior.
+            let minimum_schema = match scope {
+                LockAuditScope::Project => 5,
+                LockAuditScope::Global => GLOBAL_STATE_SCHEMA,
+            };
+            if config.schema < minimum_schema {
                 report.push(finding(
                     LockAuditReasonCode::ConfigSchemaLegacy,
                     LockAuditSeverity::Warning,
@@ -457,6 +482,7 @@ fn audit_config_lock_pair(
     config: &ConfigSelection,
     lockfile: &Lockfile,
     report: &mut LockAuditReport,
+    include_cache: bool,
 ) {
     let lock_path = report.lockfile.clone();
     for (tool, requested) in &config.tools {
@@ -549,7 +575,14 @@ fn audit_config_lock_pair(
                 Some(repair(action, None)),
             ));
         }
-        audit_locked_tool(pinset_home, scope, config_path, locked, report);
+        audit_locked_tool(
+            pinset_home,
+            scope,
+            config_path,
+            locked,
+            report,
+            include_cache,
+        );
     }
 
     for locked in &lockfile.tools {
@@ -576,6 +609,7 @@ fn audit_locked_tool(
     config_path: &Path,
     locked: &crate::LockedTool,
     report: &mut LockAuditReport,
+    include_cache: bool,
 ) {
     let lock_path = report.lockfile.clone();
     let target = current_target_for_tool(&locked.name);
@@ -599,7 +633,9 @@ fn audit_locked_tool(
         return;
     };
     report.summary.platform_artifacts += 1;
-    audit_artifact_cache(pinset_home, &subject, artifact, report);
+    if include_cache {
+        audit_artifact_cache(pinset_home, &subject, artifact, report);
+    }
     audit_install_receipt(
         pinset_home,
         scope,
@@ -610,7 +646,10 @@ fn audit_locked_tool(
         artifact,
         report,
     );
-    if scope == LockAuditScope::Project && locked.name == "python" {
+    if scope == LockAuditScope::Project
+        && locked.name == "python"
+        && python_supports_stdlib_venv(&locked.version)
+    {
         audit_python_environment(config_path, locked, &target, report);
     }
 }
@@ -736,9 +775,14 @@ fn audit_install_receipt(
     let install_dir = pinset_home
         .join("installs")
         .join(&locked.name)
-        .join(&locked.version)
+        .join(locked.installation_version())
         .join(target);
-    match validate_install_directory_chain(pinset_home, &locked.name, &locked.version, target) {
+    match validate_install_directory_chain(
+        pinset_home,
+        &locked.name,
+        &locked.installation_version(),
+        target,
+    ) {
         Ok(false) => {
             report.push(finding(
                 LockAuditReasonCode::InstallMissing,
@@ -874,7 +918,7 @@ fn audit_install_receipt(
         }
     };
     report.summary.receipts += 1;
-    if !matches!(receipt.schema, 1..=3) {
+    if !matches!(receipt.schema, 1..=4) {
         report.push(finding(
             LockAuditReasonCode::ReceiptSchemaUnsupported,
             LockAuditSeverity::Error,
@@ -919,7 +963,14 @@ fn audit_install_receipt(
         ));
         return;
     }
-    if receipt.tool != locked.name || receipt.version != locked.version || receipt.target != target
+    if receipt.tool != locked.name
+        || receipt.version != locked.version
+        || receipt
+            .install_identity
+            .as_deref()
+            .unwrap_or(&receipt.version)
+            != locked.installation_version()
+        || receipt.target != target
     {
         report.push(finding(
             LockAuditReasonCode::ReceiptIdentityMismatch,
@@ -948,7 +999,8 @@ fn audit_install_receipt(
                 Some("official" | "mirror" | "cache")
             )
             || receipt.selected_url.as_deref().is_none_or(str::is_empty)
-            || receipt.artifact_format.as_deref() != Some(artifact.format.as_str())
+            || receipt.artifact_format.as_deref()
+                != Some(expected_receipt_artifact_format(locked, artifact))
             || receipt.bytes_downloaded.is_none())
     {
         report.push(finding(
@@ -964,7 +1016,7 @@ fn audit_install_receipt(
             )),
         ));
     }
-    if receipt.schema == 3
+    if receipt.schema >= 3
         && (receipt.install_root.as_deref().is_none_or(str::is_empty)
             || receipt.file_count.is_none()
             || receipt.total_size.is_none()
@@ -978,6 +1030,25 @@ fn audit_install_receipt(
             subject,
             Some(&receipt_path),
             "schema 3 receipt is missing installation transparency metadata".to_owned(),
+            Some(repair(
+                "repair the owned installation",
+                Some("pinset install <tool@version> --repair".to_owned()),
+            )),
+        ));
+    }
+    if receipt.schema == 4
+        && receipt
+            .install_identity
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        report.push(finding(
+            LockAuditReasonCode::ReceiptInvalid,
+            LockAuditSeverity::Error,
+            LockAuditCategory::InstallReceipt,
+            subject,
+            Some(&receipt_path),
+            "schema 4 receipt is missing its structured installation identity".to_owned(),
             Some(repair(
                 "repair the owned installation",
                 Some("pinset install <tool@version> --repair".to_owned()),
@@ -1052,6 +1123,22 @@ fn audit_install_receipt(
                 None,
             )),
         ));
+    }
+}
+
+fn expected_receipt_artifact_format(
+    locked: &crate::LockedTool,
+    artifact: &LockedArtifact,
+) -> &'static str {
+    if locked.provider == "python.org-cpython"
+        && matches!(
+            locked.metadata.get("install_kind").map(String::as_str),
+            Some("msi" | "msi-bundle")
+        )
+    {
+        "msi"
+    } else {
+        artifact.format.as_str()
     }
 }
 
@@ -1214,6 +1301,11 @@ fn finding(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "windows")]
+    use std::collections::BTreeMap;
+
+    #[cfg(target_os = "windows")]
+    use crate::LockedTool;
     use crate::{
         LockedArtifact, LockedArtifactFormat, MVP_NODE_TARGETS, NodeArchiveFormat, SourceConfig,
         plan_node_artifact, save_lockfile,
@@ -1254,6 +1346,41 @@ mod tests {
             LockAuditReasonCode::ReceiptIntegrityMismatch.as_str(),
             "receipt_integrity_mismatch"
         );
+    }
+
+    #[test]
+    fn background_environment_scope_retains_install_errors_without_claiming_cache_checks() {
+        let root = tempdir().unwrap();
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        fs::create_dir(&project).unwrap();
+        fs::write(
+            project.join(PROJECT_CONFIG_FILENAME),
+            "schema = 3\n[tools]\nnode = \"24.0.0\"\n",
+        )
+        .unwrap();
+        save_lockfile(&project.join("pinset.lock"), &node_lockfile("24.0.0")).unwrap();
+        let background = audit_project_environment(&home, &project);
+        assert!(
+            background
+                .findings
+                .iter()
+                .any(|finding| finding.reason_code == LockAuditReasonCode::InstallMissing)
+        );
+        assert!(
+            !background
+                .findings
+                .iter()
+                .any(|finding| finding.category == LockAuditCategory::Cache)
+        );
+        let explicit = audit_project_lock(&home, &project);
+        assert!(
+            explicit
+                .findings
+                .iter()
+                .any(|finding| finding.category == LockAuditCategory::Cache)
+        );
+        assert!(!home.exists());
     }
 
     #[test]
@@ -1309,7 +1436,7 @@ mod tests {
         fs::create_dir(&project).expect("project");
         fs::write(
             project.join(PROJECT_CONFIG_FILENAME),
-            "schema = 4\nproject-id = \"11111111-1111-4111-8111-111111111111\"\n\n[policy]\ninherit-global = false\nsystem-fallback = false\nboundary = \"git\"\n\n[tools]\nnode = \"24.0.0\"\n",
+            "schema = 5\nproject-id = \"11111111-1111-4111-8111-111111111111\"\n\n[policy]\ninherit-global = false\nsystem-fallback = false\nboundary = \"git\"\n\n[tools]\nnode = \"24.0.0\"\n",
         )
         .expect("project config");
         save_lockfile(&project.join("pinset.lock"), &node_lockfile("24.0.0")).expect("lockfile");
@@ -1349,6 +1476,51 @@ mod tests {
         }));
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn official_python_msi_receipt_and_python_2_without_venv_pass_audit() {
+        let root = tempdir().expect("temporary root");
+        let home = root.path().join("home");
+        let project = root.path().join("project");
+        fs::create_dir(&project).expect("project");
+        fs::write(
+            project.join(PROJECT_CONFIG_FILENAME),
+            "schema = 5\nproject-id = \"11111111-1111-4111-8111-111111111111\"\n\n[policy]\ninherit-global = false\nsystem-fallback = false\nboundary = \"git\"\n\n[tools]\npython = \"2.7.18\"\n",
+        )
+        .expect("project config");
+        let lockfile = python_27_lockfile();
+        save_lockfile(&project.join("pinset.lock"), &lockfile).expect("lockfile");
+
+        let target = current_target_for_tool("python");
+        let locked = lockfile.tool("python").expect("locked Python");
+        let artifact = locked.artifact(&target).expect("current target artifact");
+        let install = home
+            .join("installs")
+            .join("python")
+            .join("2.7.18")
+            .join(&target);
+        fs::create_dir_all(&install).expect("install directory");
+        fs::write(
+            install.join(".pinset-install.toml"),
+            format!(
+                "schema = 4\ncomplete = true\ntool = \"python\"\nversion = \"2.7.18\"\ninstall_identity = \"2.7.18\"\ntarget = \"{target}\"\ncanonical_url = \"{url}\"\nselected_source = \"fixture\"\nselected_source_kind = \"official\"\nselected_url = \"{url}\"\nartifact_integrity = \"sha256:{integrity}\"\nartifact_format = \"msi\"\nbytes_downloaded = 0\ninstall_root = \"fixture\"\nfile_count = 1\ntotal_size = 1\npinset_version = \"2.12.2\"\ncritical_entries = [\"python.exe\"]\n",
+                url = artifact.canonical_url,
+                integrity = "ab".repeat(32),
+            ),
+        )
+        .expect("receipt");
+
+        let report = audit_project_lock(&home, &project);
+
+        assert!(report.passed, "findings: {:#?}", report.findings);
+        assert!(!report.findings.iter().any(|finding| {
+            matches!(
+                finding.reason_code,
+                LockAuditReasonCode::ReceiptInvalid | LockAuditReasonCode::PythonEnvironmentMissing
+            )
+        }));
+    }
+
     fn node_lockfile(version: &str) -> Lockfile {
         let artifacts = MVP_NODE_TARGETS
             .into_iter()
@@ -1378,5 +1550,39 @@ mod tests {
             "official".to_owned(),
             artifacts,
         )
+    }
+
+    #[cfg(target_os = "windows")]
+    fn python_27_lockfile() -> Lockfile {
+        Lockfile {
+            schema: LOCKFILE_SCHEMA,
+            generated_by: "pinset lock audit test".to_owned(),
+            tools: vec![LockedTool {
+                name: "python".to_owned(),
+                requested: "2.7.18".to_owned(),
+                version: "2.7.18".to_owned(),
+                provider: "python.org-cpython".to_owned(),
+                released_at: Some("2020-04-20T14:18:29Z".to_owned()),
+                metadata: BTreeMap::from([
+                    ("distribution".to_owned(), "python.org/cpython".to_owned()),
+                    ("install_kind".to_owned(), "msi".to_owned()),
+                    ("python_version".to_owned(), "2.7.18".to_owned()),
+                ]),
+                options: BTreeMap::new(),
+                artifacts: vec![LockedArtifact {
+                    target: "windows-x86_64".to_owned(),
+                    canonical_url:
+                        "https://www.python.org/ftp/python/2.7.18/python-2.7.18.amd64.msi"
+                            .to_owned(),
+                    artifact_path: "2.7.18/python-2.7.18.amd64.msi".to_owned(),
+                    sha256: "ab".repeat(32),
+                    integrity: None,
+                    format: LockedArtifactFormat::Binary,
+                    archive_root: String::new(),
+                    verification: "python-org-https-sha256".to_owned(),
+                    overlays: Vec::new(),
+                }],
+            }],
+        }
     }
 }

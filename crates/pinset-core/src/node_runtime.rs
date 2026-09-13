@@ -16,6 +16,7 @@ pub fn install_locked_node(
         .artifact(target)
         .ok_or_else(|| Error::LockedArtifactMissing {
             tool: "node".to_owned(),
+            version: locked_node.version.clone(),
             target: target.to_owned(),
         })?;
     let sources = source_config
@@ -43,6 +44,11 @@ pub fn install_locked_node(
                 LockedArtifactFormat::Zip => ArtifactFormat::Zip,
                 LockedArtifactFormat::TarXz => ArtifactFormat::TarXz,
                 LockedArtifactFormat::TarGz => ArtifactFormat::TarGz,
+                LockedArtifactFormat::Binary => {
+                    return Err(Error::InvalidLockfile {
+                        reason: "node artifact cannot use binary format".to_owned(),
+                    });
+                }
             },
         },
         strip_components: 1,

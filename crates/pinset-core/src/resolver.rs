@@ -16,9 +16,11 @@ use std::{
 use crate::current_target;
 use crate::{
     Error, Result, RuntimeCommandLayout, RuntimeEnvironmentKind, current_target_for_tool,
-    find_project_context, global_config_path, is_managed_command_shim, load_optional_global_config,
-    load_project_config, load_project_python_environment, project_python_command_candidates,
-    provider_dependency_order, runtime_provider, runtime_provider_for_command, runtime_providers,
+    find_project_context, global_config_path, is_managed_command_shim,
+    load_effective_project_config, load_optional_global_config, load_project_python_environment,
+    load_project_python_environment_for, project_python_command_candidates,
+    provider_dependency_order, python_supports_stdlib_venv, runtime_provider,
+    runtime_provider_for_command, runtime_providers,
 };
 #[cfg(feature = "lockfile")]
 use crate::{
@@ -47,6 +49,7 @@ pub struct ToolSelection {
     pub tool: String,
     pub requested: String,
     pub version: String,
+    pub installation_version: String,
     pub source: SelectionSource,
     pub config_path: PathBuf,
 }
@@ -66,6 +69,157 @@ pub struct CommandResolution {
 pub struct RuntimeEnvironmentVariable {
     pub name: &'static str,
     pub value: OsString,
+}
+
+/// The same runtime PATH and variables are used by explicit execution and direct shims.
+#[derive(Debug)]
+pub struct ExecutionContext {
+    pub path: OsString,
+    pub environment: Vec<RuntimeEnvironmentVariable>,
+    pub remove_environment: Vec<&'static str>,
+}
+
+pub fn execution_context(
+    tool: &str,
+    executable: &Path,
+    cwd: &Path,
+    home: &Path,
+) -> Result<ExecutionContext> {
+    let environment = selected_runtime_environment(tool, cwd, home);
+    let remove_environment = if environment
+        .iter()
+        .any(|variable| variable.name == "VIRTUAL_ENV")
+    {
+        vec!["PYTHONHOME"]
+    } else {
+        Vec::new()
+    };
+    Ok(ExecutionContext {
+        path: path_with_selected_tools(tool, executable, cwd, home)?,
+        environment,
+        remove_environment,
+    })
+}
+
+/// Explicit execution may use arbitrary commands, while declared runtime failures stay closed.
+pub fn resolve_execution_command(
+    command: &str,
+    cwd: &Path,
+    home: &Path,
+) -> Result<CommandResolution> {
+    if command_tool(command).is_some() {
+        return resolve_command(command, cwd, home);
+    }
+    let configured = effective_configured_tools(cwd, home)?;
+    for provider in runtime_providers()
+        .iter()
+        .filter(|provider| configured.contains_key(provider.tool))
+    {
+        resolve_command(provider.commands[0], cwd, home)?;
+    }
+    let command_path = Path::new(command);
+    let explicit_path = command_path.is_absolute() || command_path.components().count() > 1;
+    if !explicit_path && configured.contains_key("python") {
+        match resolve_project_python_command(command, cwd, home) {
+            Ok(resolution) => return Ok(resolution),
+            Err(
+                Error::RuntimeCommandNotFound { .. }
+                | Error::PythonEnvironmentSelectionMissing { .. },
+            ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    resolve_system_execution_command(command, cwd, home)
+}
+
+pub fn resolve_execution_command_for_python_environment(
+    command: &str,
+    cwd: &Path,
+    home: &Path,
+    environment_name: &str,
+    relative_path: &str,
+) -> Result<CommandResolution> {
+    if let Some(tool) = command_tool(command) {
+        return if tool == "python" {
+            resolve_project_python_command_for(command, cwd, home, environment_name, relative_path)
+        } else {
+            resolve_command(command, cwd, home)
+        };
+    }
+    let configured = effective_configured_tools(cwd, home)?;
+    for provider in runtime_providers()
+        .iter()
+        .filter(|provider| configured.contains_key(provider.tool))
+    {
+        if provider.tool == "python" {
+            resolve_project_python_command_for(
+                provider.commands[0],
+                cwd,
+                home,
+                environment_name,
+                relative_path,
+            )?;
+        } else {
+            resolve_command(provider.commands[0], cwd, home)?;
+        }
+    }
+    if configured.contains_key("python") {
+        match resolve_project_python_command_for(
+            command,
+            cwd,
+            home,
+            environment_name,
+            relative_path,
+        ) {
+            Ok(resolution) => return Ok(resolution),
+            Err(Error::RuntimeCommandNotFound { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    resolve_system_execution_command(command, cwd, home)
+}
+
+fn resolve_system_execution_command(
+    command: &str,
+    cwd: &Path,
+    home: &Path,
+) -> Result<CommandResolution> {
+    let command_path = Path::new(command);
+    let explicit_path = command_path.is_absolute() || command_path.components().count() > 1;
+    let excluded = sibling_shim_executable().into_iter().collect::<Vec<_>>();
+    let path = env::var_os("PATH");
+    let executable = if explicit_path {
+        let candidate = if command_path.is_absolute() {
+            command_path.to_path_buf()
+        } else {
+            cwd.join(command_path)
+        };
+        let candidate = fs::canonicalize(&candidate).unwrap_or(candidate);
+        (is_executable_file(&candidate)
+            && !excluded
+                .iter()
+                .any(|shim| same_executable(&candidate, shim, command)))
+        .then_some(candidate)
+    } else {
+        find_system_commands(command, cwd, home, path.as_deref(), &excluded)
+            .into_iter()
+            .next()
+    }
+    .ok_or_else(|| Error::CommandSelectionNotFound {
+        command: command.to_owned(),
+        searched: path
+            .map(|value| value.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+    })?;
+    Ok(CommandResolution {
+        command: command.to_owned(),
+        tool: String::new(),
+        requested: None,
+        version: "unknown".into(),
+        source: SelectionSource::System,
+        selection_path: find_project_context(cwd)?.config_path,
+        executable,
+    })
 }
 
 pub fn command_tool(command: &str) -> Option<&'static str> {
@@ -157,8 +311,12 @@ pub fn resolve_command_with_path(
         Err(error) => return Err(error),
     };
     let version = selection.version.clone();
+    let installation_version = selection.installation_version.clone();
 
-    if tool == "python" && selection.source == SelectionSource::Project {
+    if tool == "python"
+        && selection.source == SelectionSource::Project
+        && python_supports_stdlib_venv(&version)
+    {
         let target = current_target_for_tool(tool);
         let environment =
             load_project_python_environment(&selection.config_path, &version, &target)?;
@@ -191,7 +349,7 @@ pub fn resolve_command_with_path(
     let install_dir = pinset_home
         .join("installs")
         .join(tool)
-        .join(&version)
+        .join(&installation_version)
         .join(current_target_for_tool(tool));
     let candidates = runtime_command_candidates(tool, command, &install_dir);
     let executable = candidates
@@ -225,6 +383,16 @@ pub fn resolve_project_python_command(
     cwd: &Path,
     pinset_home: &Path,
 ) -> Result<CommandResolution> {
+    resolve_project_python_command_for(command, cwd, pinset_home, "default", ".venv")
+}
+
+pub fn resolve_project_python_command_for(
+    command: &str,
+    cwd: &Path,
+    pinset_home: &Path,
+    environment_name: &str,
+    relative_path: &str,
+) -> Result<CommandResolution> {
     let selection = resolve_tool_selection("python", cwd, pinset_home)?;
     if selection.source != SelectionSource::Project {
         return Err(Error::PythonEnvironmentSelectionMissing {
@@ -232,8 +400,44 @@ pub fn resolve_project_python_command(
         });
     }
     let target = current_target_for_tool("python");
-    let environment =
-        load_project_python_environment(&selection.config_path, &selection.version, &target)?;
+    if !python_supports_stdlib_venv(&selection.version) {
+        let install_dir = pinset_home
+            .join("installs")
+            .join("python")
+            .join(&selection.installation_version)
+            .join(&target);
+        let candidates = runtime_command_candidates("python", command, &install_dir);
+        let executable = candidates
+            .iter()
+            .find(|candidate| candidate.is_file())
+            .cloned()
+            .ok_or_else(|| Error::RuntimeCommandNotFound {
+                tool: "python".to_owned(),
+                version: selection.version.clone(),
+                command: command.to_owned(),
+                searched: candidates
+                    .iter()
+                    .map(|candidate| candidate.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            })?;
+        return Ok(CommandResolution {
+            command: command.to_owned(),
+            tool: "python".to_owned(),
+            requested: Some(selection.requested),
+            version: selection.version,
+            source: selection.source,
+            selection_path: Some(selection.config_path),
+            executable,
+        });
+    }
+    let environment = load_project_python_environment_for(
+        &selection.config_path,
+        environment_name,
+        relative_path,
+        &selection.version,
+        &target,
+    )?;
     let candidates = project_python_command_candidates(&environment, command);
     let executable = candidates
         .iter()
@@ -263,15 +467,16 @@ pub fn resolve_project_python_command(
 pub fn resolve_tool_selection(tool: &str, cwd: &Path, pinset_home: &Path) -> Result<ToolSelection> {
     let context = find_project_context(cwd)?;
     if let Some(config_path) = context.config_path.as_ref() {
-        let config = load_project_config(config_path)?;
+        let config = load_effective_project_config(config_path)?;
         if let Some(requested) = config.tools.get(tool) {
             return selection_from_config(
                 tool,
                 requested,
                 config.schema,
+                config.tool_options.get(tool),
                 SelectionSource::Project,
                 config_path,
-                lockfile_for_project(config_path),
+                (pinset_home, lockfile_for_project(config_path)),
             );
         }
         if !config.policy.inherit_global {
@@ -292,9 +497,10 @@ pub fn resolve_tool_selection(tool: &str, cwd: &Path, pinset_home: &Path) -> Res
                 tool,
                 requested,
                 global.schema,
+                None,
                 SelectionSource::Global,
                 &global_path,
-                lockfile_for_global(pinset_home),
+                (pinset_home, lockfile_for_global(pinset_home)),
             );
         }
         if config.policy.system_fallback {
@@ -314,9 +520,10 @@ pub fn resolve_tool_selection(tool: &str, cwd: &Path, pinset_home: &Path) -> Res
             tool,
             requested,
             config.schema,
+            None,
             SelectionSource::Global,
             &global_path,
-            lockfile_for_global(pinset_home),
+            (pinset_home, lockfile_for_global(pinset_home)),
         );
     }
 
@@ -352,17 +559,35 @@ fn selection_from_config(
     tool: &str,
     requested: &str,
     config_schema: u32,
+    configured_options: Option<&crate::ToolOptions>,
     source: SelectionSource,
     config_path: &Path,
-    lockfile: Result<Option<crate::Lockfile>>,
+    state: (&Path, Result<Option<crate::Lockfile>>),
 ) -> Result<ToolSelection> {
+    let (pinset_home, lockfile) = state;
+    #[cfg(not(feature = "provider-registry"))]
+    let _ = pinset_home;
     let lockfile = lockfile?;
-    let version = if let Some(lockfile) = lockfile {
-        validate_lock_matches_tool(&lockfile, tool, requested, config_path)?
-            .version
-            .clone()
-    } else if config_schema < crate::PROJECT_CONFIG_SCHEMA {
-        requested.to_owned()
+    let (version, installation_version) = if let Some(lockfile) = lockfile {
+        let locked = validate_lock_matches_tool(&lockfile, tool, requested, config_path)?;
+        let expected_options = configured_options
+            .map(crate::ToolOptions::lock_options)
+            .unwrap_or_default();
+        if locked.options != expected_options {
+            return Err(Error::LockfileMismatch {
+                selection_path: config_path.to_path_buf(),
+                tool: tool.to_owned(),
+                configured: format!("{requested} with structured options"),
+                locked: format!("{} with different structured options", locked.version),
+            });
+        }
+        #[cfg(feature = "provider-registry")]
+        if locked.provider == "declarative-github-release" {
+            crate::validate_locked_declarative_provider(pinset_home, locked)?;
+        }
+        (locked.version.clone(), locked.installation_version())
+    } else if config_schema < 5 {
+        (requested.to_owned(), requested.to_owned())
     } else {
         return Err(Error::ReadLockfile {
             path: if source == SelectionSource::Project {
@@ -383,6 +608,7 @@ fn selection_from_config(
         tool: tool.to_owned(),
         requested: requested.to_owned(),
         version,
+        installation_version,
         source,
         config_path: config_path.to_path_buf(),
     })
@@ -393,14 +619,16 @@ fn selection_from_config(
     tool: &str,
     requested: &str,
     _config_schema: u32,
+    _configured_options: Option<&crate::ToolOptions>,
     source: SelectionSource,
     config_path: &Path,
-    _lockfile: (),
+    _state: (&Path, ()),
 ) -> Result<ToolSelection> {
     Ok(ToolSelection {
         tool: tool.to_owned(),
         requested: requested.to_owned(),
         version: requested.to_owned(),
+        installation_version: requested.to_owned(),
         source,
         config_path: config_path.to_path_buf(),
     })
@@ -519,7 +747,11 @@ pub fn path_with_selected_tools(
         })?
         .to_path_buf();
     let shim_dir = pinset_home.join("shims");
-    let mut entries = vec![selected_dir.clone()];
+    let mut entries = if tool.is_empty() {
+        Vec::new()
+    } else {
+        vec![selected_dir.clone()]
+    };
     // Provider dependencies are a managed-selection contract. A command resolved from the
     // system PATH must retain ordinary system toolchain behavior instead of requiring Pinset
     // selections for that Provider's declared dependencies.
@@ -538,19 +770,21 @@ pub fn path_with_selected_tools(
             let install_dir = pinset_home
                 .join("installs")
                 .join(provider.tool)
-                .join(&selection.version)
+                .join(&selection.installation_version)
                 .join(current_target_for_tool(provider.tool));
-            let command_dir =
-                if provider.tool == "python" && selection.source == SelectionSource::Project {
-                    load_project_python_environment(
-                        &selection.config_path,
-                        &selection.version,
-                        &current_target_for_tool("python"),
-                    )?
-                    .command_directory
-                } else {
-                    runtime_command_directory(provider.tool, &install_dir)
-                };
+            let command_dir = if provider.tool == "python"
+                && selection.source == SelectionSource::Project
+                && python_supports_stdlib_venv(&selection.version)
+            {
+                load_project_python_environment(
+                    &selection.config_path,
+                    &selection.version,
+                    &current_target_for_tool("python"),
+                )?
+                .command_directory
+            } else {
+                runtime_command_directory(provider.tool, &install_dir)
+            };
             if command_dir.is_dir()
                 && !paths_equal(&command_dir, &selected_dir)
                 && !entries.iter().any(|entry| paths_equal(entry, &command_dir))
@@ -573,21 +807,23 @@ pub fn path_with_selected_tools(
         let install_dir = pinset_home
             .join("installs")
             .join(provider.tool)
-            .join(&selection.version)
+            .join(&selection.installation_version)
             .join(current_target_for_tool(provider.tool));
-        let command_dir =
-            if provider.tool == "python" && selection.source == SelectionSource::Project {
-                let Ok(environment) = load_project_python_environment(
-                    &selection.config_path,
-                    &selection.version,
-                    &current_target_for_tool("python"),
-                ) else {
-                    continue;
-                };
-                environment.command_directory
-            } else {
-                runtime_command_directory(provider.tool, &install_dir)
+        let command_dir = if provider.tool == "python"
+            && selection.source == SelectionSource::Project
+            && python_supports_stdlib_venv(&selection.version)
+        {
+            let Ok(environment) = load_project_python_environment(
+                &selection.config_path,
+                &selection.version,
+                &current_target_for_tool("python"),
+            ) else {
+                continue;
             };
+            environment.command_directory
+        } else {
+            runtime_command_directory(provider.tool, &install_dir)
+        };
         if command_dir.is_dir() && !entries.iter().any(|entry| paths_equal(entry, &command_dir)) {
             entries.push(command_dir);
         }
@@ -607,7 +843,7 @@ pub fn path_with_selected_tools(
 fn effective_configured_tools(cwd: &Path, pinset_home: &Path) -> Result<BTreeMap<String, String>> {
     let context = find_project_context(cwd)?;
     if let Some(config_path) = context.config_path {
-        let config = load_project_config(&config_path)?;
+        let config = load_effective_project_config(&config_path)?;
         if !config.policy.inherit_global {
             return Ok(config.tools);
         }
@@ -632,8 +868,13 @@ pub fn selected_runtime_environment(
     pinset_home: &Path,
 ) -> Vec<RuntimeEnvironmentVariable> {
     let mut variables = Vec::new();
-    let Ok(mut providers) = provider_dependency_order(tool) else {
-        return variables;
+    let mut providers = if tool.is_empty() {
+        Vec::new()
+    } else {
+        let Ok(providers) = provider_dependency_order(tool) else {
+            return variables;
+        };
+        providers
     };
     if let Ok(configured_tools) = effective_configured_tools(cwd, pinset_home) {
         for provider in runtime_providers()
@@ -658,10 +899,11 @@ pub fn selected_runtime_environment(
         let install_dir = pinset_home
             .join("installs")
             .join(provider.tool)
-            .join(&selection.version)
+            .join(&selection.installation_version)
             .join(current_target_for_tool(provider.tool));
         if provider.capabilities.environment == RuntimeEnvironmentKind::Python {
             if selection.source == SelectionSource::Project
+                && python_supports_stdlib_venv(&selection.version)
                 && let Ok(environment) = load_project_python_environment(
                     &selection.config_path,
                     &selection.version,
@@ -671,6 +913,11 @@ pub fn selected_runtime_environment(
                 variables.push(RuntimeEnvironmentVariable {
                     name: "VIRTUAL_ENV",
                     value: environment.root.into_os_string(),
+                });
+            } else if install_dir.is_dir() && !selection.version.contains('+') {
+                variables.push(RuntimeEnvironmentVariable {
+                    name: "PYTHONHOME",
+                    value: install_dir.into_os_string(),
                 });
             }
         } else if install_dir.is_dir() {

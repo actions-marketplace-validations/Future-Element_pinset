@@ -15,6 +15,14 @@ pub const RUST_TARGETS: [&str; 5] = [
 pub const RUST_PROFILE: &str = "default";
 pub const RUST_COMPONENTS: &str = "rustc,cargo,rust-std,rust-docs,rustfmt,clippy";
 
+pub(crate) fn rust_component_name(component: &str) -> &str {
+    match component {
+        "rustfmt-preview" => "rustfmt",
+        "clippy-preview" => "clippy",
+        other => other,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RustArchiveFormat {
     TarXz,
@@ -128,6 +136,37 @@ pub fn plan_rust_artifact(
 
 pub fn validate_exact_rust_version(version: &str) -> Result<()> {
     RustVersion::parse(version).map(|_| ())
+}
+
+pub fn plan_rust_nightly_artifact(
+    version: &str,
+    date: &str,
+    target: &str,
+    canonical_url: &str,
+) -> Result<RustArtifactPlan> {
+    RustVersion::parse(version)?;
+    validate_release_date(date)?;
+    let triple = rust_target_triple(target)?;
+    let archive_name = format!("rust-nightly-{triple}.tar.xz");
+    let expected_url = format!("https://static.rust-lang.org/dist/{date}/{archive_name}");
+    let url = Url::parse(canonical_url).map_err(|source| Error::InvalidRustArtifact {
+        reason: format!("invalid nightly archive URL: {source}"),
+    })?;
+    if url.as_str() != expected_url {
+        return Err(Error::InvalidRustArtifact {
+            reason: format!("nightly archive URL must be {expected_url}"),
+        });
+    }
+    Ok(RustArtifactPlan {
+        version: version.to_owned(),
+        target: target.to_owned(),
+        triple,
+        date: date.to_owned(),
+        artifact_path: format!("dist/{date}/{archive_name}"),
+        archive_root: format!("rust-nightly-{triple}"),
+        format: RustArchiveFormat::TarXz,
+        canonical_url: url.to_string(),
+    })
 }
 
 pub fn rust_target_triple(target: &str) -> Result<&'static str> {

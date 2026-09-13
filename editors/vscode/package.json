@@ -1,0 +1,185 @@
+{
+  "name": "pinset-vscode",
+  "displayName": "Pinset",
+  "description": "Pinset toolchain status, diagnostics, environments, and project tasks.",
+  "version": "1.2.0",
+  "publisher": "FutureElement",
+  "icon": "icon.png",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Future-Element/pinset.git"
+  },
+  "homepage": "https://pinset.future-element.com/",
+  "bugs": {
+    "url": "https://github.com/Future-Element/pinset/issues"
+  },
+  "galleryBanner": {
+    "color": "#111827",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": [
+    "Other",
+    "Linters",
+    "Testing"
+  ],
+  "keywords": [
+    "pinset",
+    "toolchain",
+    "environment",
+    "tasks"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Pinset shows a locked status and starts no CLI or task process until Workspace Trust is granted."
+    },
+    "virtualWorkspaces": false
+  },
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "workspaceContains:pinset.toml",
+    "onTaskType:pinset",
+    "onCommand:pinset.refresh",
+    "onCommand:pinset.install",
+    "onCommand:pinset.initializeProject",
+    "onCommand:pinset.selectEnvironment",
+    "onCommand:pinset.runTask",
+    "onCommand:pinset.checkDiagnostics"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "pinset.refresh",
+        "title": "Pinset: Refresh Status"
+      },
+      {
+        "command": "pinset.install",
+        "title": "Pinset: Install CLI"
+      },
+      {
+        "command": "pinset.initializeProject",
+        "title": "Pinset: Initialize Project"
+      },
+      {
+        "command": "pinset.selectEnvironment",
+        "title": "Pinset: Select Environment"
+      },
+      {
+        "command": "pinset.runTask",
+        "title": "Pinset: Run Project Task"
+      },
+      {
+        "command": "pinset.checkDiagnostics",
+        "title": "Pinset: Check Diagnostics"
+      },
+      {
+        "command": "pinset.prepareEnvironment",
+        "title": "Pinset: Prepare Project Environment"
+      },
+      {
+        "command": "pinset.probeEnvironment",
+        "title": "Pinset: Probe Selected Runtimes"
+      },
+      {
+        "command": "pinset.bindEnvironment",
+        "title": "Pinset: Bind Editor Runtime"
+      },
+      {
+        "command": "pinset.restoreBindings",
+        "title": "Pinset: Restore Editor Bindings"
+      },
+      {
+        "command": "pinset.probeDebug",
+        "title": "Pinset: Probe Native Debugger"
+      }
+    ],
+    "configuration": {
+      "title": "Pinset",
+      "properties": {
+        "pinset.executablePath": {
+          "type": "string",
+          "default": "pinset",
+          "description": "Pinset CLI executable. The extension passes arguments without a shell."
+        }
+      }
+    },
+    "taskDefinitions": [
+      {
+        "type": "pinset",
+        "required": [
+          "task"
+        ],
+        "properties": {
+          "task": {
+            "type": "string",
+            "description": "Task name from pinset.toml."
+          },
+          "folder": {
+            "type": "string",
+            "description": "Workspace-folder URI for multi-root workspaces."
+          }
+        }
+      }
+    ],
+    "views": {
+      "explorer": [
+        {
+          "name": "Pinset Environment",
+          "id": "pinset.environments"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "when": "view == pinset.environments",
+          "command": "pinset.refresh",
+          "group": "navigation"
+        },
+        {
+          "command": "pinset.prepareEnvironment",
+          "when": "view == pinset.environments"
+        },
+        {
+          "command": "pinset.probeEnvironment",
+          "when": "view == pinset.environments"
+        },
+        {
+          "command": "pinset.bindEnvironment",
+          "when": "view == pinset.environments"
+        },
+        {
+          "command": "pinset.restoreBindings",
+          "when": "view == pinset.environments"
+        },
+        {
+          "command": "pinset.probeDebug",
+          "when": "view == pinset.environments"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "compile": "esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js --sourcemap",
+    "compile:test": "esbuild src/protocol.ts src/process-tree.ts src/process-error.ts src/install.ts src/diagnostic-model.ts src/status-model.ts --bundle --platform=node --format=cjs --outdir=dist/test",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run compile && npm run compile:test && node --test test/*.test.cjs",
+    "package": "npm run typecheck && npm run test && vsce package --no-dependencies --out dist/pinset-vscode.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/vscode": "^1.95.0",
+    "@vscode/vsce": "^3.6.2",
+    "esbuild": "^0.25.9",
+    "typescript": "^5.9.2"
+  },
+  "extensionKind": [
+    "workspace"
+  ]
+}
