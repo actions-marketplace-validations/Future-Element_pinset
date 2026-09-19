@@ -1,8 +1,7 @@
 import Link from "next/link";
-import { commandNavigation, type CommandGroup } from "@/lib/commands";
+import type { CommandGroup } from "@/lib/commands";
 import type { Locale } from "@/lib/site";
 import { localePrefix } from "@/lib/site";
-import { DocsShell } from "./docs-shell";
 import { LatestReleaseVersion } from "./latest-release";
 
 export function CommandIndexPage({ locale, groups }: { locale: Locale; groups: CommandGroup[] }) {
@@ -11,7 +10,7 @@ export function CommandIndexPage({ locale, groups }: { locale: Locale; groups: C
   const count = groups.reduce((total, group) => total + group.commands.length, 0);
 
   return (
-    <DocsShell groups={commandNavigation(groups)} locale={locale}>
+    <>
       <article className="docPage commandIndexPage">
         <header className="docHeader compactHeader">
           <div className="breadcrumbs"><Link href={prefix || "/"}>{zh ? "文档" : "Documentation"}</Link><span>/</span>{zh ? "命令" : "Commands"}</div>
@@ -23,13 +22,13 @@ export function CommandIndexPage({ locale, groups }: { locale: Locale; groups: C
             <section key={group.title} id={group.commands[0]?.slug}>
               <div className="directoryHeading"><h2>{group.title}</h2><span>{group.commands.length}</span></div>
               <div className="directoryList">
-                {group.commands.map((command) => <Link href={`${prefix}/docs/commands/${command.slug}`} key={command.slug}><code>pinset {command.title}</code><span>{command.description}</span><b>→</b></Link>)}
+                {group.commands.map((command) => <Link href={`${prefix}/docs/commands/${command.slug}`} key={command.slug} scroll={false}><code>pinset {command.title}</code><span>{command.description}</span><b>→</b></Link>)}
               </div>
             </section>
           ))}
         </div>
         <footer className="pageFooter"><span>Pinset <LatestReleaseVersion fallback={zh ? "最新版本" : "latest"} /> CLI</span><Link href={prefix || "/"}>{zh ? "返回首页" : "Back to home"} →</Link></footer>
       </article>
-    </DocsShell>
+    </>
   );
 }

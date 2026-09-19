@@ -42,6 +42,11 @@ pub fn fingerprint(cwd: &Path, profile: Option<&str>, no_env: bool) -> ReportRes
     let no_env = no_env || std::env::var_os("PINSET_ENV_DISABLE").is_some_and(|value| value == "1");
     let root = fs::canonicalize(cwd)?;
     let mut digest = Sha256::new();
+    digest.update(
+        pinset_core::work_directory_identity(&root)?
+            .namespace
+            .as_bytes(),
+    );
     let root_text = root.to_string_lossy();
     let target = current_target();
     for part in [
@@ -213,6 +218,8 @@ pub fn collect(
         execution_verified: false,
         requirements: None,
         variables: Default::default(),
+        configuration_origins: Default::default(),
+        directory_identity: None,
     };
     let Some(path) = path else {
         report.checks.push(check(
@@ -225,6 +232,8 @@ pub fn collect(
     };
     let config = load_effective_project_config(&path)?;
     let root = path.parent().ok_or("project configuration has no parent")?;
+    report.configuration_origins = pinset_core::project_configuration_origins(&path)?;
+    report.directory_identity = Some(pinset_core::work_directory_identity(root)?.namespace);
     report.project_root = Some(fs::canonicalize(root)?.display().to_string());
     report.project_id = config.project_id.clone();
     report.requirements = config.requirements.clone();
@@ -477,7 +486,8 @@ pub fn collect(
                 &home,
                 root,
                 id,
-                &toml::to_string(environment).unwrap_or_default(),
+                &crate::environment::environment_trust_context(&path, environment)
+                    .unwrap_or_default(),
             )
         });
         let (trusted, reason) = match trust {
@@ -493,7 +503,6 @@ pub fn collect(
             Some("pinset trust add --project-id <reviewed-project-id>"),
         ));
         let identity = std::env::var_os("PINSET_IDENTITY").is_some_and(|value| !value.is_empty())
-            || std::env::var_os("PINSET_IDENTITY_FILE").is_some()
             || pinset_env::list_identities(&home).is_ok_and(|identities| !identities.is_empty());
         report.checks.push(check(
             "environment.identity",

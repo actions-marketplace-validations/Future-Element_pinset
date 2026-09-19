@@ -76,6 +76,118 @@ fn environment_probe_task(profile: &str) -> ProjectTask {
 }
 
 #[test]
+fn workspace_members_inherit_ciphertext_but_keep_profile_and_trust_local() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let root = temp.path().join("workspace");
+    fs::create_dir(&root).unwrap();
+    let root_config = pinset_core::create_project_config(&root).unwrap();
+    let one = root.join("one");
+    let two = root.join("two");
+    for member in [&one, &two] {
+        fs::create_dir(member).unwrap();
+        let path = pinset_core::create_project_config(member).unwrap();
+        let mut config = pinset_core::load_project_config(&path).unwrap();
+        config.policy.system_fallback = true;
+        pinset_core::save_project_config(&path, &config).unwrap();
+    }
+    let identity = generate_identity();
+    let mut config = pinset_core::load_project_config(&root_config).unwrap();
+    config.environment = Some(ProjectEnvironment {
+        auto_profile: Some("dev".into()),
+        profiles: ["dev", "test"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name.into(),
+                    EnvironmentProfile {
+                        file: format!(".env.{name}"),
+                        recipients: vec![identity.record.recipient.clone()],
+                    },
+                )
+            })
+            .collect(),
+        ..Default::default()
+    });
+    let mut content = toml::to_string(&config).unwrap();
+    content.push_str("\n[workspace]\nmembers = [\"one\", \"two\"]\n");
+    fs::write(&root_config, content).unwrap();
+    for name in ["dev", "test"] {
+        write_encrypted_profile(
+            &root,
+            &format!(".env.{name}"),
+            &EnvironmentDocument {
+                schema: 1,
+                variables: BTreeMap::from([("APP_TEST_VALUE".into(), name.into())]),
+            },
+            std::slice::from_ref(&identity.record.recipient),
+        )
+        .unwrap();
+    }
+    success(&cli(&root, &home).args(["trust", "add"]).output().unwrap());
+    let mut untrusted = cli(&one, &home);
+    untrusted.env("PINSET_IDENTITY", identity.secret().expose_secret());
+    print_variable(&mut untrusted);
+    assert!(
+        !untrusted.output().unwrap().status.success(),
+        "root trust must not extend to a member"
+    );
+    for (member, profile) in [(&one, "test"), (&two, "dev")] {
+        success(
+            &cli(member, &home)
+                .args(["env", "use", profile])
+                .output()
+                .unwrap(),
+        );
+        success(&cli(member, &home).args(["trust", "add"]).output().unwrap());
+        let status = success(
+            &cli(member, &home)
+                .arg("env")
+                .env("HOSTNAME", "different-shell-export")
+                .env("WSL_DISTRO_NAME", "shell-only-label")
+                .output()
+                .unwrap(),
+        );
+        assert!(
+            status.contains("trust=trusted"),
+            "shell exports must not change host ownership"
+        );
+    }
+    std::thread::scope(|scope| {
+        for (member, profile) in [(&one, "test"), (&two, "dev")] {
+            let identity = &identity;
+            let home = &home;
+            scope.spawn(move || {
+                let mut command = cli(member, home);
+                command.env("PINSET_IDENTITY", identity.secret().expose_secret());
+                print_variable(&mut command);
+                assert!(
+                    success(&command.output().unwrap()).contains(&format!("profile={profile}"))
+                );
+                assert!(
+                    success(
+                        &cli(member, home)
+                            .args(["env", "check"])
+                            .env("PINSET_IDENTITY", identity.secret().expose_secret())
+                            .output()
+                            .unwrap()
+                    )
+                    .contains("is ready")
+                );
+            });
+        }
+    });
+    let member_config = fs::read(one.join("pinset.toml")).unwrap();
+    fs::rename(&one, root.join("previous-one")).unwrap();
+    fs::create_dir(&one).unwrap();
+    fs::write(one.join("pinset.toml"), member_config).unwrap();
+    let status = success(&cli(&one, &home).arg("env").output().unwrap());
+    assert!(status.contains("profile=dev source=project"));
+    assert!(!status.contains("trust=trusted"));
+    assert!(success(&cli(&two, &home).arg("env").output().unwrap()).contains("trust=trusted"));
+}
+
+#[test]
 fn short_execution_preserves_child_arguments_exit_codes_and_legacy_errors() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
@@ -146,7 +258,7 @@ fn local_profiles_apply_to_execution_and_broker_with_explicit_and_ci_overrides()
                 (
                     name.into(),
                     EnvironmentProfile {
-                        file: format!("pinset.env/{name}.age"),
+                        file: format!(".env.{name}"),
                         recipients: vec![identity.record.recipient.clone()],
                     },
                 )
@@ -162,7 +274,7 @@ fn local_profiles_apply_to_execution_and_broker_with_explicit_and_ci_overrides()
     for name in ["dev", "test"] {
         write_encrypted_profile(
             &project,
-            &format!("pinset.env/{name}.age"),
+            &format!(".env.{name}"),
             &EnvironmentDocument {
                 schema: 1,
                 variables: BTreeMap::from([("APP_TEST_VALUE".into(), name.into())]),
@@ -269,7 +381,7 @@ fn local_profiles_apply_to_execution_and_broker_with_explicit_and_ci_overrides()
     assert!(
         pinset_env::read_encrypted_profile(
             &project,
-            "pinset.env/test.age",
+            ".env.test",
             std::slice::from_ref(colleague.secret())
         )
         .is_ok()
@@ -284,7 +396,7 @@ fn local_profiles_apply_to_execution_and_broker_with_explicit_and_ci_overrides()
     assert!(
         pinset_env::read_encrypted_profile(
             &project,
-            "pinset.env/test.age",
+            ".env.test",
             std::slice::from_ref(colleague.secret())
         )
         .is_err()
@@ -381,7 +493,7 @@ fn paired_shim_uses_the_local_profile_without_a_shared_default() {
         profiles: BTreeMap::from([(
             "dev".into(),
             EnvironmentProfile {
-                file: "pinset.env/dev.age".into(),
+                file: ".env.dev".into(),
                 recipients: vec![identity.record.recipient.clone()],
             },
         )]),
@@ -390,7 +502,7 @@ fn paired_shim_uses_the_local_profile_without_a_shared_default() {
     pinset_core::save_project_config(&config_path, &config).unwrap();
     write_encrypted_profile(
         &project,
-        "pinset.env/dev.age",
+        ".env.dev",
         &EnvironmentDocument {
             schema: 1,
             variables: BTreeMap::from([("APP_TEST_VALUE".into(), "local-dev".into())]),
@@ -467,11 +579,12 @@ fn incomplete_noninteractive_setup_has_no_side_effects() {
     let home = root.path().join("home");
     let config_path = pinset_core::create_project_config(root.path()).unwrap();
     let original = fs::read(&config_path).unwrap();
-    for args in [vec!["env", "init"], vec!["env", "init", "dev"]] {
-        let output = cli(root.path(), &home).args(args).output().unwrap();
-        assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("non-interactive"));
-    }
+    let output = cli(root.path(), &home)
+        .args(["env", "init"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("non-interactive"));
     assert_eq!(fs::read(config_path).unwrap(), original);
     assert!(!home.exists());
 }
